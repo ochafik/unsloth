@@ -36,16 +36,20 @@ const FRAME = fileURLToPath(
   new URL("../src/features/chat/mcp-apps/mcp-app-frame.tsx", import.meta.url),
 );
 const text = readFileSync(FRAME, "utf8");
+const permissionsCsp = readFileSync(
+  new URL("../src/features/chat/mcp-apps/permissions-csp.ts", import.meta.url),
+  "utf8",
+);
 const adapter = readFileSync(
   new URL("../src/features/chat/api/chat-adapter.ts", import.meta.url),
   "utf8",
 );
 
-function liftFunction<T>(signature: string): T {
-  const start = text.indexOf(signature);
-  assert.ok(start >= 0, `${signature} is no longer in mcp-app-frame.tsx`);
-  const end = text.indexOf("\n}\n", start);
-  const declaration = text.slice(start, end + 3).replace(/^export /, "");
+function liftFunction<T>(signature: string, source = permissionsCsp): T {
+  const start = source.indexOf(signature);
+  assert.ok(start >= 0, `${signature} is no longer in the module that declared it`);
+  const end = source.indexOf("\n}\n", start);
+  const declaration = source.slice(start, end + 3).replace(/^export /, "");
   const name = /function (\w+)/.exec(declaration)?.[1];
   return new Function(
     `${
@@ -114,10 +118,10 @@ test("requested permissions become the SDK's allow attribute", () => {
 test("only what the page itself holds is passed on, and only behind the proxy", () => {
   // Studio's own Permissions-Policy header turns camera and geolocation off: a
   // grant the page does not hold would be advertised and then refused.
-  const start = text.indexOf("const PERMISSION_FEATURES");
-  const end = text.indexOf("\n}\n", text.indexOf("export function grantablePermissions("));
+  const start = permissionsCsp.indexOf("const PERMISSION_FEATURES");
+  const end = permissionsCsp.indexOf("\n}\n", permissionsCsp.indexOf("export function grantablePermissions("));
   const grantable = new Function(
-    `${ts.transpileModule(text.slice(start, end + 3).replace(/export /g, ""), {
+    `${ts.transpileModule(permissionsCsp.slice(start, end + 3).replace(/export /g, ""), {
       compilerOptions: { target: ts.ScriptTarget.ES2020 },
     }).outputText}; return grantablePermissions;`,
   )() as (requested: unknown, holds: (f: string) => boolean) => Record<string, object>;
