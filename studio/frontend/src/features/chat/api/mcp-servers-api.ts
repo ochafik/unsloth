@@ -296,6 +296,8 @@ export interface McpUiResource {
   mime_type: string;
   text: string;
   blob?: string | null;
+  /** Declared domains the sandbox refuses for this server (the host's policy, not the template's). */
+  blocked_domains?: string[];
   ui: {
     csp?: {
       connectDomains?: string[];
