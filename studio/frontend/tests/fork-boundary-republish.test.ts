@@ -49,6 +49,10 @@ function harness(
       import.meta.url,
     ),
     {
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
       "../api/chat-api": {
         ChatMessageProtectedError: class extends Error {},
         saveChatMessage: async (message: unknown) => message,

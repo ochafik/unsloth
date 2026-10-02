@@ -451,7 +451,7 @@ function ToolFallbackMcpApp({
   return (
     <Suspense
       fallback={
-        <div className="mt-2 h-[120px] w-full animate-pulse rounded bg-muted/30" />
+        <div className="mt-2 h-[calc(120px*var(--ui-space-scale,1))] w-full animate-pulse rounded bg-muted/30" />
       }
     >
       <McpAppFrame

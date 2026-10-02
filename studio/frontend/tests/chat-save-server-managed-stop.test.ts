@@ -31,6 +31,10 @@ function harness(options: { rejectIds?: Set<string>; failWith?: Error } = {}) {
       import.meta.url,
     ),
     {
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
       "../api/chat-api": {
         ChatMessageProtectedError: FakeProtectedError,
         saveChatMessage: async (message: { id: string }) => {

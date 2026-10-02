@@ -50,6 +50,10 @@ function loadStorage(options: {
       import.meta.url,
     ),
     {
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
       "../api/chat-api": {
         buildBackendChatExport: async () => ({ threads: [], messages: [] }),
         ChatThreadDeletedError: class extends Error {},
