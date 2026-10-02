@@ -320,6 +320,11 @@ FACTORIES = {
         fragment = "MCP server is disabled",
         query = {"uri": "ui://matrix/probe.html"},
     ),
+    "routes.mcp_servers:GET:/{server_id}/ui-tools": Factory(
+        "prov-mcp-refresh",
+        success = 400,
+        fragment = "MCP server is disabled",
+    ),
     "routes.mcp_servers:POST:/{server_id}/ui-tool-call": Factory(
         "prov-mcp-refresh",
         {"tool_name": "probe"},
