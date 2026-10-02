@@ -5,6 +5,7 @@
 // features -- and where its sandbox proxy is served. No React, no store: node tests
 // load this as is.
 
+import { buildAllowAttribute } from "@modelcontextprotocol/ext-apps/app-bridge";
 import type { McpUiResource } from "../api/mcp-servers-api";
 
 /** The outside hosts a template declared it will reach, for the user to see: the
@@ -24,7 +25,8 @@ export function externalDomains(
   for (const value of all) {
     if (typeof value !== "string") continue;
     const trimmed = value.trim();
-    if (!trimmed || ["blob:", "data:"].includes(trimmed.toLowerCase())) continue;
+    if (!trimmed || ["blob:", "data:"].includes(trimmed.toLowerCase()))
+      continue;
     hosts.add(trimmed.replace(/^[a-z]+:\/\//i, ""));
   }
   return [...hosts];
@@ -32,20 +34,9 @@ export function externalDomains(
 
 export type Permissions = NonNullable<McpUiResource["ui"]["permissions"]>;
 
-/** The Permission Policy `allow` value for what a template asked for: the SDK's
- *  buildAllowAttribute mapping. */
-export function allowAttribute(permissions: Permissions | undefined): string {
-  if (!permissions || typeof permissions !== "object") return "";
-  return [
-    ["camera", "camera"],
-    ["microphone", "microphone"],
-    ["geolocation", "geolocation"],
-    ["clipboardWrite", "clipboard-write"],
-  ]
-    .filter(([key]) => Boolean(permissions[key as keyof Permissions]))
-    .map(([, feature]) => feature)
-    .join("; ");
-}
+/** The Permission Policy `allow` value for what a template asked for: the SDK's mapping. */
+export const allowAttribute: (permissions: Permissions | undefined) => string =
+  buildAllowAttribute;
 
 const PERMISSION_FEATURES: [keyof Permissions, string][] = [
   ["camera", "camera"],
@@ -59,14 +50,18 @@ const PERMISSION_FEATURES: [keyof Permissions, string][] = [
  *  would be advertised to the view and then refused by the browser. Browsers with
  *  no policy API are given the benefit of the doubt; the browser decides anyway. */
 export function hostHoldsFeature(feature: string): boolean {
-  const policy = (
-    document as Document & {
-      permissionsPolicy?: { allowsFeature?: (feature: string) => boolean };
-      featurePolicy?: { allowsFeature?: (feature: string) => boolean };
-    }
-  ).permissionsPolicy ?? (document as Document & {
-    featurePolicy?: { allowsFeature?: (feature: string) => boolean };
-  }).featurePolicy;
+  const policy =
+    (
+      document as Document & {
+        permissionsPolicy?: { allowsFeature?: (feature: string) => boolean };
+        featurePolicy?: { allowsFeature?: (feature: string) => boolean };
+      }
+    ).permissionsPolicy ??
+    (
+      document as Document & {
+        featurePolicy?: { allowsFeature?: (feature: string) => boolean };
+      }
+    ).featurePolicy;
   if (!policy || typeof policy.allowsFeature !== "function") return true;
   try {
     return policy.allowsFeature(feature);
@@ -106,7 +101,9 @@ export function sandboxOriginFor(
   if (backend.protocol !== "http:") return null;
   // Loopback is potentially trustworthy, so a secure page (the Windows desktop
   // app's https://tauri.localhost) may still frame it; nothing else over HTTP.
-  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(backend.hostname);
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(
+    backend.hostname,
+  );
   if (page.protocol === "https:" && !loopback) return null;
   const origin = `http://${backend.hostname}:${port}`;
   // Different by construction (another port), but never hand the view the host's.
