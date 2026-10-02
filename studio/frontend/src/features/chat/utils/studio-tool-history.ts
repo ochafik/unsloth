@@ -16,6 +16,9 @@ export type StudioToolHistoryOptions = {
   /** When set, only these tool-call parts count. Use this to ignore provider builtins that OpenAI
    *  serialization drops, so ownership matches the payload. */
   toolCallSurvives?: (part: ToolHistoryPart) => boolean;
+  /** The request carries Studio's own synthetic calls (the widget-context read), which
+   *  exist only on the wire, in no message part: they are Studio-owned tool history. */
+  hasSyntheticStudioCalls?: boolean;
 };
 
 export function hasOnlyStudioOwnedToolHistory(
@@ -23,7 +26,7 @@ export function hasOnlyStudioOwnedToolHistory(
   options?: StudioToolHistoryOptions,
 ): boolean {
   const survives = options?.toolCallSurvives;
-  let sawToolCall = false;
+  let sawToolCall = options?.hasSyntheticStudioCalls === true;
   for (const message of messages) {
     for (const part of message.content ?? []) {
       if (part.type !== "tool-call") continue;

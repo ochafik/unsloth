@@ -67,6 +67,10 @@ function loadStorage(backend: {
         ThreadRecordWriteCoordinator: StubWriteCoordinator,
       },
       "../stores/fork-boundary-store": { setForkBoundary: () => {} },
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
     },
   );
 }

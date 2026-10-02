@@ -79,6 +79,10 @@ function loadStorage() {
         },
       },
       "../stores/fork-boundary-store": { setForkBoundary: () => {} },
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
     },
   );
   return { storage, requests };

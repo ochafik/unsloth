@@ -22,6 +22,7 @@ function open(): SnapshotDb {
   if (!db) {
     db = new Dexie(accountDatabaseName("unsloth-mcp-app-context")) as SnapshotDb;
     db.version(1).stores({ snapshots: "messageId, createdAt" });
+    db.version(2).stores({ snapshots: "messageId, createdAt, threadId" });
   }
   return db;
 }
@@ -32,6 +33,11 @@ export function registerMcpAppContextDb(): void {
     getMany: (messageIds) => open().snapshots.bulkGet([...messageIds]),
     put: async (snapshot) => {
       await open().snapshots.put(snapshot);
+    },
+    deleteForMessages: (messageIds) =>
+      open().snapshots.bulkDelete([...messageIds]),
+    deleteForThreads: async (threadIds) => {
+      await open().snapshots.where("threadId").anyOf([...threadIds]).delete();
     },
   });
 }

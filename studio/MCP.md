@@ -27,9 +27,19 @@ isolated mode and says so under the widget.
 **What the model sees and does.** The widget mounts while the model is still
 writing the tool's arguments and receives them as they stream in; when the
 result lands, the widget is seeded with it without reloading. A widget can
-report its state to the model (`ui/update-model-context`); the model reads the
-last report before each of your messages, images included on
-image-capable models. A widget can also ask to send a chat message as you —
+report its state to the model (`ui/update-model-context`). That content is
+third-party data, so it never enters your message: when you send, Studio
+puts a synthetic `read_widget_context` tool call and its result ahead of your
+message, labelled as untrusted widget-provided data, with the widget's text
+(capped) and, on image-capable models, its image. The pair is captured once per
+message and replayed unchanged, so history stays append-only, and only the
+widgets of the conversation you are in are read. It is stored per message and
+deleted with its message or conversation. The pair is ordinary tool history
+for every backend (local GGUF/safetensors/MLX, OpenAI Chat and Responses,
+Anthropic, Gemini, other compatible providers), so no provider needs a
+real tool; images ride the same MCP image envelope as any MCP tool result,
+which is promoted to a labelled image turn right after the result. A widget
+can also ask to send a chat message as you --
 that always shows a Send / Don't send prompt first, and its own tool calls go
 through the chat's permission level (Allow / Deny / Always allow), exactly like
 the model's calls.
