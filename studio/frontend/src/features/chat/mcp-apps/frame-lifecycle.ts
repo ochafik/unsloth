@@ -21,6 +21,8 @@ const PARKING_LOT_ATTR = "data-mcp-app-parking-lot";
 export interface ParkableSession {
   /** The frame is off screen: nobody can be asked anything on its behalf. */
   park(): void;
+  /** The frame is leaving the card; drop what it told the model. */
+  retire?(): void;
   /** Close the bridge and the view's port. */
   close(): void;
 }
@@ -119,6 +121,7 @@ export function retireFrame(
     frame.remove();
     return;
   }
+  session.retire?.();
   if (!parkFrame(frame)) {
     session.close();
     frame.remove();

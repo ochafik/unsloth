@@ -296,6 +296,17 @@ test("a parked frame's bridge refuses what needs the user, and leaves model cont
   );
 });
 
+test("a retiring frame clears its model context, scoped to the thread it was set in", () => {
+  assert.match(bridgeSource, /retire\(\) \{[^}]*clearMcpAppModelContext\(toolCallId\)/s);
+  assert.match(bridgeSource, /setMcpAppModelContext\(ctx\.toolCallId, \{\s*toolName: ctx\.toolName,\s*\.\.\.\(ctx\.threadId \? \{ threadId: ctx\.threadId \} : \{\}\)/);
+  const retire = lifecycle.slice(lifecycle.indexOf("export function retireFrame("));
+  assert.ok(
+    retire.indexOf("session.retire?.()") !== -1 &&
+      retire.indexOf("session.retire?.()") < retire.indexOf("parkFrame(frame)"),
+    "context is cleared before the frame is parked, whichever way it goes",
+  );
+});
+
 test("a widget's link is shown to the user and rate limited", () => {
   const open = bridgeSource.slice(
     bridgeSource.indexOf("bridge.onopenlink"),

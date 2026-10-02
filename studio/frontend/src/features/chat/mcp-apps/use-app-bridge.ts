@@ -33,7 +33,7 @@ import {
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
 import type { ParkableSession } from "./frame-lifecycle";
 import { type McpUiEnvelope, toolResultParams } from "./mcp-ui";
-import { setMcpAppModelContext } from "./model-context";
+import { clearMcpAppModelContext, setMcpAppModelContext } from "./model-context";
 import { PortTransport } from "./port-transport";
 import type { PromptController } from "./pending-prompts";
 import type { Permissions } from "./permissions-csp";
@@ -160,6 +160,13 @@ export function createViewSession(
     cancelledTold: false,
     park() {
       session.parked = true;
+    },
+    retire() {
+      // The frame is leaving (unmounted, re-keyed or switched away): whatever it last
+      // told the model about itself is no longer the state of anything on screen. A
+      // parked frame refuses further updates, so nothing can re-set it afterwards.
+      const toolCallId = getContext().toolCallId;
+      if (toolCallId) clearMcpAppModelContext(toolCallId);
     },
     close() {
       void bridge.close().catch(() => {});
@@ -311,6 +318,7 @@ export function createViewSession(
       if (session.parked) throw new ProtocolError(DECLINED, NOT_ON_SCREEN);
       setMcpAppModelContext(ctx.toolCallId, {
         toolName: ctx.toolName,
+        ...(ctx.threadId ? { threadId: ctx.threadId } : {}),
         ...(content !== undefined ? { content: content as unknown[] } : {}),
         ...(structuredContent !== undefined ? { structuredContent } : {}),
       });
