@@ -4142,6 +4142,20 @@ class ExternalProviderClient:
                     )
                 ):
                     contents[-1]["parts"].extend(parts)
+                elif (
+                    gemini_role == "model"
+                    and contents
+                    and contents[-1].get("role") == "model"
+                    and any(isinstance(p, dict) and "functionCall" in p for p in parts)
+                    and not any(
+                        isinstance(p, dict) and "functionCall" in p
+                        for p in (contents[-1].get("parts") or [])
+                    )
+                ):
+                    # Gemini 400s on a functionCall turn that does not directly follow a user turn or a
+                    # functionResponse. A call replayed straight after the model's own text (the chat client's
+                    # synthetic read_widget_context call follows the previous reply) joins that turn instead.
+                    contents[-1]["parts"].extend(parts)
                 else:
                     contents.append({"role": gemini_role, "parts": parts})
 
