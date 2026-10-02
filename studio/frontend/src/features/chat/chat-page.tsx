@@ -111,11 +111,12 @@ import {
 } from "@hugeicons/core-free-icons";
 import { useAui } from "@assistant-ui/react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { useNavigate } from "@tanstack/react-router";
+import { useBlocker, useNavigate } from "@tanstack/react-router";
 import {
   SaveTemporaryChatButton,
   TemporaryChatSaveBridge,
 } from "./components/temporary-chat-save";
+import { hasLiveMcpAppsLeaving, tearDownLiveMcpApps } from "./mcp-apps/live-apps";
 import { Tooltip as TooltipPrimitive } from "radix-ui";
 import {
   type CSSProperties,
@@ -2216,6 +2217,10 @@ export type ChatSearch = {
   project?: string;
 };
 
+// How long leaving a conversation may wait for its MCP App widgets to answer
+// ui/resource-teardown. An SDK view answers at once; this bounds one that does not.
+const MCP_APP_NAVIGATION_GRACE_MS = 1_500;
+
 export function validateChatSearch(search: Record<string, unknown>): ChatSearch {
   return {
     thread: typeof search.thread === "string" ? search.thread : undefined,
@@ -2242,6 +2247,31 @@ export function ChatPage({
     (s) => s.showContextWindowUsage,
   );
   const navigate = useNavigate();
+
+  // Leaving a conversation takes its MCP App widgets with it. They are told first,
+  // and waited for, while still mounted: the spec has the host send
+  // ui/resource-teardown before tearing a View down and wait for its answer, and a
+  // frame React removes is gone before any message could reach it. Off /chat the
+  // page stays mounted, frozen, and so do its widgets.
+  useBlocker({
+    shouldBlockFn: ({ next }) => {
+      if (next.pathname !== "/chat") return false;
+      const nextThread = (next.search as ChatSearch | undefined)?.thread;
+      if (!hasLiveMcpAppsLeaving(nextThread)) return false;
+      return tearDownLiveMcpApps(
+        nextThread,
+        "The user left this conversation.",
+        MCP_APP_NAVIGATION_GRACE_MS,
+      ).then(() => {
+        // The widgets answered; their parked frames have nothing left to serve.
+        void import("./mcp-apps/mcp-app-frame").then((m) =>
+          m.clearParkedMcpAppFrames(),
+        );
+        return false;
+      });
+    },
+    enableBeforeUnload: false,
+  });
 
   const settingsOpen = useChatRuntimeStore((s) => s.settingsPanelOpen);
   const setSettingsOpen = useChatRuntimeStore((s) => s.setSettingsPanelOpen);

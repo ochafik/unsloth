@@ -1449,6 +1449,13 @@ def _graceful_shutdown(server = None):
     except Exception as e:
         logger.warning("Error stopping the LAN listener: %s", e)
 
+    # The MCP App sandbox listeners share that loop too.
+    try:
+        from mcp_app_sandbox import request_sandbox_shutdown
+        request_sandbox_shutdown()
+    except Exception as e:
+        logger.warning("Error stopping the MCP App sandbox listeners: %s", e)
+
     try:
         from core.training.training import _training_backend
         if _training_backend is not None:

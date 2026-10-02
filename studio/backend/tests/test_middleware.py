@@ -1580,3 +1580,33 @@ def test_health_reports_the_default_for_a_settings_saved_endpoint(main_module, m
         "hf_endpoint": "https://huggingface.co",
         "hf_datasets_server": "https://datasets-server.huggingface.co",
     }
+
+
+# MCP Apps: the page may frame the sandbox proxy on another port of its own host
+
+
+class TestMcpAppSandboxFrameSource:
+    @pytest.mark.parametrize(
+        "host, expected",
+        [
+            ("127.0.0.1:8888", "http://127.0.0.1:*"),
+            ("localhost:8888", "http://localhost:*"),
+            ("192.168.1.5:8888", "http://192.168.1.5:*"),
+            ("studio.local", "http://studio.local:*"),
+            ("[::1]:8888", "http://[::1]:*"),
+            (None, ""),
+            ("", ""),
+            # Anything that could reach another directive is dropped, not echoed.
+            ("evil.example; script-src *", ""),
+            ("evil.example 'unsafe-inline'", ""),
+        ],
+    )
+    def test_frame_source(self, main_module, host, expected):
+        assert main_module._mcp_app_frame_source(host) == expected
+
+    def test_policy_names_it_only_when_a_host_is_known(self, main_module):
+        assert "frame-src 'self'; " in main_module._build_csp("N")
+        with_host = main_module._build_csp("N", host = "127.0.0.1:8888")
+        assert "frame-src 'self' http://127.0.0.1:*; " in with_host
+        # Nothing else in the policy moves.
+        assert with_host.replace(" http://127.0.0.1:*", "") == main_module._build_csp("N")

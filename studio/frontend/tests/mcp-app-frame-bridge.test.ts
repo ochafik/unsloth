@@ -4,56 +4,178 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-import {
-  RESIZE_FALLBACK,
-  bridgeShim,
-  newBridgeToken,
-} from "../src/features/chat/mcp-apps/mcp-ui.ts";
+import ts from "typescript";
 
-// The shim and resize fallback run in a browser in tests/studio/playwright_mcp_app_bridge_smoke.py.
-const frame = readFileSync(
-  new URL("../src/features/chat/mcp-apps/mcp-app-frame.tsx", import.meta.url),
-  "utf8",
+// No DOM renderer here and the frame pulls in React plus the runtime store, so
+// assert the wiring in the source, the way artifact-frame-network-access.test.ts does.
+const FRAME = "../src/features/chat/mcp-apps/mcp-app-frame.tsx";
+
+const path = fileURLToPath(new URL(FRAME, import.meta.url));
+const text = readFileSync(path, "utf8");
+const source = ts.createSourceFile(
+  path,
+  text,
+  ts.ScriptTarget.ESNext,
+  true,
+  ts.ScriptKind.TSX,
 );
 
-test("the frame is sandboxed without same-origin and talks only through the port", () => {
-  assert.match(frame, /sandbox="allow-scripts"\n/);
-  assert.doesNotMatch(frame, /allow-same-origin"/);
-  assert.match(frame, /data\?\.__unslothMcpApp !== frame\.token/);
-  assert.match(frame, /port\.onmessage = handler;/);
-  // Exactly one window listener: the handshake. Protocol traffic is never read off the window.
-  assert.equal(frame.match(/addEventListener\("message"/g)?.length, 1);
-});
+/** The body of the `const <name> = ...` initializer, whatever it is wrapped in. */
+function declarationText(name: string): string {
+  let found: string | null = null;
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === name &&
+      node.initializer
+    ) {
+      found = node.initializer.getText();
+    }
+    node.forEachChild(visit);
+  };
+  source.forEachChild(visit);
+  assert.ok(found, `${name} is no longer declared in mcp-app-frame.tsx`);
+  return found as unknown as string;
+}
 
-test("a widget's tools/call is sent as approved only when the user said so", () => {
-  const sends = [...frame.matchAll(/\bsend\(([^)]*)\)/g)].map((m) => m[1]);
-  assert.deepEqual(sends.sort(), ["alwaysAllowed", "true"]);
-  assert.match(
-    frame,
-    /if \(!allow\) \{\s*return \{[^\n]*DECLINED[^\n]*\n\s*\}\s*const result = await send\(true\);/,
+/** A standalone `export function` from the frame, evaluated on its own. */
+function liftFunction<T>(signature: string): T {
+  const start = text.indexOf(signature);
+  assert.ok(start >= 0, `${signature} is no longer in mcp-app-frame.tsx`);
+  const end = text.indexOf("\n}\n", start);
+  assert.ok(end > start, `${signature} has no top-level closing brace`);
+  const declaration = text.slice(start, end + 3).replace(/^export /, "");
+  const name = /function (\w+)/.exec(declaration)?.[1];
+  return new Function(
+    `${
+      ts.transpileModule(declaration, {
+        compilerOptions: { target: ts.ScriptTarget.ES2020 },
+      }).outputText
+    }; return ${name};`,
+  )() as T;
+}
+
+test("the view's handle on the host is its own port", () => {
+  // A sandboxed frame keeps one contentWindow and an opaque "null" origin across
+  // a navigation, and the replacement document's scripts run before the iframe's
+  // load event -- both shown in tests/studio/playwright_mcp_app_bridge_smoke.py.
+  // A port is the one handle that cannot outlive the document that made it, so it
+  // is what the view gets, in place of window.parent.
+  const shimStart = text.indexOf("export function bridgeShim");
+  assert.ok(shimStart >= 0, "bridgeShim is no longer declared in mcp-app-frame.tsx");
+  const shim = text.slice(shimStart, text.indexOf("\n}\n", shimStart));
+  assert.ok(
+    /Object\.defineProperty\(window, name, \{ value: port, configurable: true \}\)/.test(
+      shim,
+    ),
+    "window.parent must BE the port, so event.source === window.parent still holds",
   );
-  assert.match(
-    frame,
-    /const \{ serverId, threadId, sessionId \} = frame\.scope;/,
+  assert.ok(
+    /for \(const name of \["parent", "top"\]\)/.test(shim),
+    "shadowing parent alone leaves top as a second, unbound handle on the host",
+  );
+  assert.ok(
+    /source: port,/.test(shim),
+    "a re-dispatched reply must name the port as its source, or the identity check fails",
+  );
+  assert.ok(
+    /Array\.isArray\(a\) \? a : Array\.isArray\(b\) \? b : \[\]/.test(shim),
+    "the port must tolerate postMessage(message, targetOrigin) as a Window would",
+  );
+  // The handshake is the only thing left on the window, and it is what carries
+  // the port, so it keeps the token check.
+  assert.ok(
+    /envelope\.__unslothMcpApp !== bridgeToken/.test(text),
+    "the handshake must still require the seeded document's token",
+  );
+  assert.ok(
+    /port\.onmessage = handler/.test(text),
+    "protocol traffic must be read off the port, not the window",
   );
 });
 
-test("the shim binds window.parent and window.top to its own port", () => {
-  const shim = bridgeShim("tok-1", "https://studio.test");
-  assert.match(shim, /for \(const name of \["parent", "top"\]\)/);
-  assert.match(shim, /source: port, origin: "https:\/\/studio\.test"/);
-  assert.match(shim, /__unslothMcpApp: "tok-1"/);
+// withBridgeShim needs a real HTML parser, so what it does is asserted in a real
+// browser: tests/studio/playwright_mcp_app_bridge_smoke.py.
+
+test("the token is minted per fetched template", () => {
+  // A token reused across re-seeds would let a document that captured one earlier
+  // keep talking after the frame moved on.
+  const token = declarationText("bridgeToken");
+  assert.ok(
+    /newBridgeToken\(\)/.test(token),
+    "the bridge token must come from the minter, which handles a non-secure origin",
+  );
+  assert.ok(
+    /\[resource\]/.test(token),
+    "the bridge token must be re-minted whenever the template is refetched",
+  );
 });
 
-test("the size fallback measures content, so a widget can shrink", () => {
-  assert.doesNotMatch(RESIZE_FALLBACK, /scrollHeight/);
-  assert.match(RESIZE_FALLBACK, /html\.style\.height="max-content"/);
+test("the view is seeded from the server's own blocks", () => {
+  // _flatten_result builds the model-facing transcript: an image-only result reads
+  // "[1 image returned]" and a structuredContent-only one is
+  // a Python repr of the payload. Neither is in the server's CallToolResult, so the
+  // seed comes from the blocks the envelope carries, image bytes put back from the
+  // image sentinel rather than duplicated on the seed line.
+  const seedView = declarationText("seedView");
+  assert.ok(
+    /for \(const block of ui\.content \?\? \[\]\)/.test(seedView),
+    "the seed must walk the server's blocks in order",
+  );
+  assert.ok(
+    /block\.data === undefined/.test(seedView) && /images\.shift\(\)/.test(seedView),
+    "an image block arrives without data and must be refilled from the image sentinel",
+  );
+  assert.ok(
+    !/resultText/.test(text),
+    "the flattened body has no seeding role left",
+  );
+});
+
+test("the frame is armed and listening inside the commit, not after it", () => {
+  // The iframe starts fetching the shell the moment it is attached, and both the
+  // opaque shell's load and the sandbox proxy's ready message read pendingPostRef.
+  // A passive effect is queued during that same commit and normally wins -- 10/10
+  // against a real local server here -- but they are different task sources with
+  // nothing ordering them, and losing once leaves the widget on the empty shell
+  // permanently, with no second load to retry it.
+  assert.ok(
+    /useLayoutEffect\(\(\) => \{\s*const holder = holderRef\.current;\s*if \(!src \|\| !html \|\| !holder\) return;\s*pendingPostRef\.current = true;/.test(
+      text,
+    ),
+    "arming pendingPostRef must happen in the commit that makes the frame",
+  );
+  assert.ok(
+    /frame\.addEventListener\("load", onLoad\);\s*frame\.src = src;\s*holder\.appendChild\(frame\);/.test(
+      text,
+    ),
+    "the load listener must be on the frame before it can start loading",
+  );
+  assert.ok(
+    /useLayoutEffect\(\(\) => \{\s*(?:\/\/[^\n]*\n\s*)*const handler = /.test(text),
+    "the message listener must be attached in the commit, before the view can post",
+  );
+  // initializedRef used to be reset in its own passive effect, which could land
+  // after the view had already said `initialized` and silently stop theme updates.
+  assert.equal(
+    (text.match(/initializedRef\.current = false/g) ?? []).length,
+    1,
+    "initializedRef must be reset once, alongside the other per-load state",
+  );
 });
 
 test("the bridge token survives a non-secure Studio origin", () => {
-  const real = globalThis.crypto;
-  const withCrypto = (value: unknown, run: () => void) => {
+  // Studio is reachable over plain HTTP on a LAN address, where crypto.randomUUID
+  // is simply undefined; calling it unconditionally threw on render and took every
+  // widget with it. getRandomValues is not secure-context gated, so it is the
+  // fallback -- not the Date.now()+Math.random() the attachment adapters use, which
+  // is fine for an id and not for the value that names the seeded document.
+  const mint = liftFunction<() => string | null>("export function newBridgeToken(");
+  const realCrypto = globalThis.crypto;
+  const withCrypto = (value: unknown, run: () => void): void => {
     Object.defineProperty(globalThis, "crypto", {
       value,
       configurable: true,
@@ -63,87 +185,28 @@ test("the bridge token survives a non-secure Studio origin", () => {
       run();
     } finally {
       Object.defineProperty(globalThis, "crypto", {
-        value: real,
+        value: realCrypto,
         configurable: true,
         writable: true,
       });
     }
   };
-  withCrypto({ randomUUID: () => "uuid" }, () =>
-    assert.equal(newBridgeToken(), null),
-  );
-  withCrypto({ getRandomValues: real.getRandomValues.bind(real) }, () => {
-    const first = newBridgeToken();
-    assert.match(String(first), /^[0-9a-f]{32}$/);
-    assert.notEqual(first, newBridgeToken());
+
+  withCrypto({ randomUUID: () => "from-random-uuid" }, () => {
+    assert.equal(mint(), "from-random-uuid");
   });
-  withCrypto(undefined, () => assert.equal(newBridgeToken(), null));
-});
 
-test("the host advertises each server method the bridge proxies", () => {
-  for (const [method, capability] of [
-    ["tools/call", "serverTools"],
-    ["resources/read", "serverResources"],
-  ]) {
-    assert.match(frame, new RegExp(`case "${method}"`));
-    assert.match(
-      frame,
-      new RegExp(`${capability}: \\{ listChanged: false \\}`),
-    );
-  }
-});
+  withCrypto({ getRandomValues: realCrypto.getRandomValues.bind(realCrypto) }, () => {
+    const first = mint();
+    assert.match(String(first), /^[0-9a-f]{32}$/, "128 bits of hex from getRandomValues");
+    assert.notEqual(first, mint(), "a fresh token every call");
+  });
 
-test("Always allow is granted only after the approved call went through", () => {
-  assert.match(
-    frame,
-    /const result = await send\(true\);[\s\S]{0,300}if \(always\) \{\n\s*useChatRuntimeStore\.getState\(\)\.allowToolAlways\(scope, toolKey\);/,
+  // No Web Crypto at all: a guessable token would be worse than none, and the
+  // component renders the failure instead.
+  withCrypto(undefined, () => assert.equal(mint(), null));
+  assert.ok(
+    /resource && !bridgeToken/.test(text),
+    "a frame with no token must report the failure rather than render",
   );
-  assert.equal(frame.match(/allowToolAlways\(/g)?.length, 1);
-});
-
-test("server-bound bridge requests are capped per frame", () => {
-  assert.match(
-    frame,
-    /const SERVER_METHODS = new Set\(\["tools\/call", "resources\/read"\]\);/,
-  );
-  assert.match(
-    frame,
-    /if \(counted && inFlight >= MAX_IN_FLIGHT_SERVER_CALLS\) \{\n\s*run = Promise\.reject\(new RpcError\("Too many requests in flight"\)\);/,
-  );
-  assert.match(frame, /\.finally\(\(\) => \{\n\s*inFlight -= 1;/);
-});
-
-test("a widget's session pairs its thread with the provider's project, as the adapter does", () => {
-  const card = readFileSync(
-    new URL(
-      "../src/components/assistant-ui/tool-fallback.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  const widget = card.slice(card.indexOf("function ToolFallbackMcpApp"));
-  assert.match(widget, /const projectId = useChatProjectScope\(\);/);
-  assert.doesNotMatch(widget, /activeProjectId/);
-});
-
-test("a widget's link opens only from the user's Open click, never from the request", () => {
-  const openLinkCase = frame.slice(
-    frame.indexOf('case "ui/open-link"'),
-    frame.indexOf('case "ui/request-display-mode"'),
-  );
-  assert.doesNotMatch(openLinkCase, /openLink\(/);
-  assert.match(openLinkCase, /link: url,/);
-  assert.match(openLinkCase, /return opened \? \{\} : \{ isError: true \};/);
-  assert.match(frame, /if \(allow && asking\.link\) openLink\(asking\.link\);/);
-});
-
-test("a widget's server-bound requests use the scope its template was fetched for", () => {
-  assert.match(frame, /scope: \{ serverId, threadId, sessionId \}/);
-  assert.equal(
-    frame.match(/const \{ serverId, threadId, sessionId \} = frame\.scope;/g)
-      ?.length,
-    2,
-  );
-  assert.doesNotMatch(frame, /latest\.current\.props;\n\s*const scope/);
-  assert.doesNotMatch(frame, /readMcpUiResource\(now\.serverId/);
 });

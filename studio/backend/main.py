@@ -952,6 +952,11 @@ async def lifespan(app: FastAPI):
 
     await asyncio.to_thread(_release_api_usage_writer, _api_usage_writer_lease)
 
+    # The MCP App sandbox listeners run on this loop; stop them before it does.
+    from mcp_app_sandbox import close_sandbox_listeners
+
+    await close_sandbox_listeners()
+
     from core.inference.openai_codex_auth import shutdown_flows
 
     await shutdown_flows()
@@ -1115,7 +1120,32 @@ def _reportable_hf_endpoints(request) -> dict:
     return reported
 
 
-def _build_csp(script_nonce: "str | None" = None, *, docs: bool = False) -> str:
+def _mcp_app_frame_source(host_header: "str | None") -> str:
+    """Any port of the hostname this page was requested on, or "" when there is none.
+
+    MCP App widgets are rendered through a sandbox proxy on another port of that same
+    host (mcp_app_sandbox.py: the spec requires the proxy's origin to differ from the
+    host's), and ``'self'`` never matches another port. The ports are started on first
+    use, after this page's policy is fixed, so the port itself cannot be named."""
+    if not host_header:
+        return ""
+    try:
+        hostname = urlparse(f"http://{host_header}").hostname or ""
+    except ValueError:
+        return ""
+    if not hostname or not _re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", hostname):
+        return ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    return f"http://{hostname}:*"
+
+
+def _build_csp(
+    script_nonce: "str | None" = None,
+    *,
+    docs: bool = False,
+    host: "str | None" = None,
+) -> str:
     script_src = "script-src 'self'"
     style_src = "style-src 'self' 'unsafe-inline'"
     worker_src = "worker-src 'self'"
@@ -1160,6 +1190,7 @@ def _build_csp(script_nonce: "str | None" = None, *, docs: bool = False) -> str:
         )
     else:
         connect_src = f"'self' {hf_connect_src}"
+    mcp_app_frames = _mcp_app_frame_source(host)
 
     return (
         "default-src 'self'; "
@@ -1170,7 +1201,7 @@ def _build_csp(script_nonce: "str | None" = None, *, docs: bool = False) -> str:
         f"{script_src}; "
         f"{worker_src}; "
         f"{font_src}; "
-        "frame-src 'self'; "
+        f"frame-src 'self'{(' ' + mcp_app_frames) if mcp_app_frames else ''}; "
         f"frame-ancestors {frame_ancestors}; "
         "form-action 'self'; "
         "base-uri 'self'"
@@ -1206,9 +1237,13 @@ class SecurityHeadersMiddleware:
                 nonce = headers.get(_CSP_SCRIPT_NONCE_HEADER)
                 if nonce is not None:
                     del headers[_CSP_SCRIPT_NONCE_HEADER]
+                request_host = next(
+                    (v.decode("latin-1") for k, v in scope.get("headers") or [] if k == b"host"),
+                    None,
+                )
                 headers.setdefault(
                     "Content-Security-Policy",
-                    _build_csp(nonce, docs = path in _DOCS_PATHS),
+                    _build_csp(nonce, docs = path in _DOCS_PATHS, host = request_host),
                 )
                 # Omit X-Frame-Options in Colab: DENY would block serve_kernel_port_as_iframe regardless of CSP.
                 if not _IS_COLAB and path not in _FRAME_SHELL_PATHS:

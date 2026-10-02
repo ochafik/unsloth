@@ -312,6 +312,20 @@ FACTORIES = {
     "routes.mcp_servers:POST:/{server_id}/refresh": Factory(
         "prov-mcp-refresh", fragment = '"ok":false'
     ),
+    # The widget routes look the server up before anything else, so the seeded
+    # (disabled) server answers its owner with 400 and everyone else with 404.
+    "routes.mcp_servers:GET:/{server_id}/ui-resource": Factory(
+        "prov-mcp-refresh",
+        success = 400,
+        fragment = "MCP server is disabled",
+        query = {"uri": "ui://matrix/probe.html"},
+    ),
+    "routes.mcp_servers:POST:/{server_id}/ui-tool-call": Factory(
+        "prov-mcp-refresh",
+        {"tool_name": "probe"},
+        success = 400,
+        fragment = "MCP server is disabled",
+    ),
     "routes.prompts:PUT:/entries/{entry_id}": Factory(
         "prov-prompt-entry",
         PROMPT_ENTRY_BODY,

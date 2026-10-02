@@ -9,7 +9,7 @@ from typing import Annotated, Optional
 from urllib.parse import urlparse
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from integrations.blender import service as blender
 from models.mcp_servers import BlenderSettings, BlenderSetup, McpBuiltinResponse
 
@@ -40,6 +40,7 @@ from core.inference.mcp_client import (
     serialize_mcp_server_mutation,
     stdio_mcp_disabled_reason,
     stdio_mcp_enabled,
+    tool_ui_resource_uri,
     tool_visible_to,
 )
 from core.inference.mcp_config_import import parse_mcp_config
@@ -56,6 +57,8 @@ from models.mcp_servers import (
     McpStdioCommand,
     McpStdioDecodeRequest,
     McpStdioEncodeResponse,
+    McpAppSandboxResponse,
+    McpUiToolsResponse,
     McpUiResourceResponse,
     McpUiToolCallRequest,
     McpUiToolCallResult,
@@ -704,6 +707,58 @@ def _ui_call_kwargs(server_id: str, server: dict, thread_id, session_id) -> dict
         "scope": mcp_session_scope(session_id, thread_id),
         "config_check": lambda: _row_still_matches(server_id, server),
     }
+
+
+@router.get("/app-sandbox", response_model = McpAppSandboxResponse)
+async def mcp_app_sandbox(
+    request: Request,
+    server_id: str,
+    via_api_key: ViaApiKey = False,
+):
+    """The port this server's widgets are rendered from.
+
+    MCP Apps requires a web host to render a View through a sandbox proxy on an
+    origin other than its own; a port is part of an origin, so this starts (once)
+    a listener on another port of the very address this request arrived on, which
+    is an address the caller can already reach. None means the frame falls back to
+    an opaque-origin sandbox."""
+    _ui_server_or_404(server_id, via_api_key)
+    local = request.scope.get("server")
+    if not local or not local[0]:
+        return McpAppSandboxResponse(port = None)
+    from mcp_app_sandbox import ensure_sandbox_port
+
+    try:
+        port = await ensure_sandbox_port(str(local[0]), server_id, primary_port = local[1])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mcp_servers.app_sandbox_unavailable", error = str(exc))
+        return McpAppSandboxResponse(port = None)
+    return McpAppSandboxResponse(port = port)
+
+
+@router.get("/{server_id}/ui-tools", response_model = McpUiToolsResponse)
+async def mcp_ui_tools(
+    server_id: str,
+    via_api_key: ViaApiKey = False,
+):
+    """This server's tools that render a ui:// template: name -> template.
+
+    Lets the chat draw a tool's widget while the model is still streaming the
+    call's arguments (ui/notifications/tool-input-partial), rather than only
+    once its result settles. Cache only, like every widget path."""
+    _ui_server_or_404(server_id, via_api_key)
+    from core.inference.tools import get_cached_tools
+
+    tools = get_cached_tools(server_id) or []
+    return McpUiToolsResponse(
+        tools = {
+            tool["name"]: uri
+            for tool in tools
+            if isinstance(tool, dict)
+            and tool.get("name")
+            and (uri := tool_ui_resource_uri(tool))
+        }
+    )
 
 
 @router.get("/{server_id}/ui-resource", response_model = McpUiResourceResponse)

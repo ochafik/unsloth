@@ -4215,50 +4215,89 @@ async def artifact_preview_frame(allow_network: bool = False):
     )
 
 
-# A bare "*" is refused: such a template gets the default-deny.
+# A ui:// template reuses the HTML canvas' opaque-origin shell, but its CSP is
+# built per resource from the domains it declared in _meta.ui.csp.
+
+# A hostname, optionally scheme/port and a leading "*." wildcard. A bare "*" is
+# refused: a template asking for every origin gets the default-deny instead.
 _MCP_APP_DOMAIN_RE = _re.compile(
-    r"^(?:(?:https?|wss?)://)?"
-    r"(?:\*\.)?"
+    r"^(?:(?:https?|wss?)://)?"  # optional scheme
+    r"(?:\*\.)?"  # optional leading wildcard label
     r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
     r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
     r"(?::[0-9]{1,5})?$"
 )
+# Bounds the header a template can ask for.
 _MCP_APP_MAX_DOMAINS = 24
-# Documents/workers from these schemes inherit this policy and origin; bare "https:" would equal "*".
+# A document or worker loaded from one of these inherits this policy, the sandbox
+# flags and the opaque origin, so neither widens the box. Any other bare scheme
+# ("https:") names every host, which is the "*" refused above.
 _MCP_APP_LOCAL_SCHEMES = frozenset({"blob:", "data:"})
 
 
 def _mcp_app_domains(raw: Optional[str], local_schemes: bool = True) -> list:
-    """Non-host entries are dropped: these come from the browser and go into a response header."""
+    """Parse a comma-separated declared-domain list into CSP source tokens.
+    Anything that is not a host is dropped rather than echoed: these arrive from
+    the browser and go straight into a response header."""
+    if not raw:
+        return []
     out = []
-    for part in (raw or "").split(","):
+    for part in raw.split(","):
         candidate = part.strip()
+        if not candidate or len(out) >= _MCP_APP_MAX_DOMAINS:
+            continue
         if local_schemes and candidate.lower() in _MCP_APP_LOCAL_SCHEMES:
             out.append(candidate.lower())
-        elif _MCP_APP_DOMAIN_RE.fullmatch(candidate):
+        elif _MCP_APP_DOMAIN_RE.match(candidate):
             out.append(candidate)
-    return out[:_MCP_APP_MAX_DOMAINS]
+    return out
 
 
-def _mcp_app_csp(connect: list, resource: list, frame: list, base_uri: list) -> str:
-    none = "'none'"
-    directives = {
-        "default-src": [],
-        "script-src": ["'unsafe-inline'", *resource],
-        "style-src": ["'unsafe-inline'", *resource],
-        "img-src": ["data:", "blob:", *resource],
-        "font-src": ["data:", *resource],
-        "media-src": ["data:", "blob:", *resource],
-        "connect-src": connect,
-        "frame-src": frame,
-        "worker-src": ["blob:"] if "blob:" in resource else [],
-        "object-src": [],
-        "base-uri": base_uri,
-        "form-action": [],
-        "frame-ancestors": [_ARTIFACT_PREVIEW_FRAME_ANCESTORS],
-    }
-    policy = [f"{name} {' '.join(srcs) or none}" for name, srcs in directives.items()]
-    return "; ".join(policy) + "; sandbox allow-scripts"
+def _mcp_app_csp(
+    connect: list,
+    resource: list,
+    frame: list,
+    base_uri: list,
+    *,
+    frame_ancestors: str = _ARTIFACT_PREVIEW_FRAME_ANCESTORS,
+    opaque: bool = True,
+) -> str:
+    """The sandbox policy for one template: the canvas shell's default-deny,
+    widened only by the directives the template declared.
+
+    ``opaque`` pins ``sandbox allow-scripts`` in the header, which forces an
+    opaque origin whatever the iframe says. The MCP Apps sandbox proxy is served
+    from its own origin and must keep it (the spec requires allow-same-origin
+    there), so it builds the same policy without that directive and with the one
+    host origin it will be embedded by as its ancestor."""
+    # Built as plain locals rather than inline conditionals: nested same-quote
+    # f-string expressions need Python 3.12, and this file targets 3.11.
+    connect_src = " ".join(connect) if connect else "'none'"
+    frame_src = " ".join(frame) if frame else "'none'"
+    base_uri_src = " ".join(base_uri) if base_uri else "'none'"
+    # The local schemes are allowed whether declared or not, as the reference host
+    # does: a View already runs arbitrary inline script, so a blob: or data: script,
+    # eval, or a blob: Worker (which inherits this policy) reaches nothing it could
+    # not -- the network stays exactly what connect-src declares. Refusing them only
+    # breaks real Views: the published PDF viewer runs PDF.js in a blob: Worker and
+    # falls back to a data: module, and declares neither.
+    local = " ".join(dict.fromkeys(("blob:", "data:", *resource)))
+    return (
+        "default-src 'none'; "
+        f"script-src 'unsafe-inline' 'unsafe-eval' {local}; "
+        f"style-src 'unsafe-inline' {local}; "
+        f"img-src {local}; "
+        f"font-src {local}; "
+        f"media-src {local}; "
+        f"connect-src {connect_src}; "
+        f"frame-src {frame_src}; "
+        f"worker-src {' '.join(dict.fromkeys(('blob:', *resource)))}; "
+        "object-src 'none'; "
+        f"base-uri {base_uri_src}; "
+        "form-action 'none'; "
+        f"frame-ancestors {frame_ancestors}"
+        + ("; sandbox allow-scripts" if opaque else "")
+    )
 
 
 @studio_router.get("/mcp-app-frame", include_in_schema = False)
@@ -4268,13 +4307,20 @@ async def mcp_app_frame(
     frame: Optional[str] = None,
     base_uri: Optional[str] = None,
 ):
-    """Unauthenticated like the canvas shell: no server resource here; calls use the authenticated /ui-tool-call."""
+    """Serve the opaque sandbox shell for an MCP App widget.
+
+    Unauthenticated like the canvas shell it reuses: the URL is readable by the
+    widget and this static document exposes no server resource. Its HTML arrives
+    by postMessage, and its calls go through the authenticated /ui-tool-call.
+    """
     csp = _mcp_app_csp(
         _mcp_app_domains(connect),
         _mcp_app_domains(resource),
         _mcp_app_domains(frame),
         _mcp_app_domains(base_uri, local_schemes = False),
     )
+    # The spec's audit trail: the host SHOULD log the CSP each View is given.
+    logger.info("MCP App opaque sandbox policy: %s", csp)
     return Response(
         content = _ARTIFACT_PREVIEW_FRAME_HTML,
         media_type = "text/html; charset=utf-8",

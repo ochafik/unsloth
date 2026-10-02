@@ -122,6 +122,19 @@ class McpUiResourceResponse(BaseModel):
     contents: list[dict] = Field(default_factory = list)
 
 
+class McpUiToolsResponse(BaseModel):
+    """A server's UI-rendering tools: tool name -> ui:// template."""
+
+    tools: dict[str, str] = Field(default_factory = dict)
+
+
+class McpAppSandboxResponse(BaseModel):
+    """Where one server's widgets are rendered: a port on the address the caller
+    reached Studio on, or None when no second origin could be started there."""
+
+    port: Optional[int] = None
+
+
 class McpUiToolCallRequest(BaseModel):
     tool_name: str
     arguments: dict = Field(default_factory = dict)

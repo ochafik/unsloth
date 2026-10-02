@@ -556,6 +556,60 @@ def _stdio_argv(parts: list, env: Optional[dict]) -> list:
     return [executable, *parts[1:]]
 
 
+# MCP Apps negotiates through the SEP-1724 extensions capability: a server is told the
+# host renders ui:// templates, and one that gates its UI tools on that (the SDK's
+# getUiCapability) registers them for this client at all. Without it such a server
+# hands Studio its text-only variants and no widget is ever drawn.
+MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
+MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
+
+
+def _advertise_mcp_apps(session: Any) -> None:
+    """Add the MCP Apps extension to this session's initialize request.
+
+    The SDK's ClientSession builds its capabilities itself and has no parameter for
+    extensions, so the request is amended on its way out. ClientCapabilities allows
+    extra fields and serializes them, which is exactly where the extension lives."""
+    if session is None or getattr(session, "_unsloth_mcp_apps", False):
+        return
+    import mcp.types as mcp_types
+
+    send = session.send_request
+
+    async def send_request(request, *args, **kwargs):
+        root = getattr(request, "root", None)
+        if isinstance(root, mcp_types.InitializeRequest):
+            caps = root.params.capabilities
+            fields = caps.model_dump(by_alias = True, exclude_none = True)
+            extensions = dict(fields.get("extensions") or {})
+            extensions.setdefault(MCP_APPS_EXTENSION_ID, {"mimeTypes": [MCP_APP_MIME_TYPE]})
+            fields["extensions"] = extensions
+            root.params.capabilities = mcp_types.ClientCapabilities.model_validate(fields)
+        return await send(request, *args, **kwargs)
+
+    session.send_request = send_request
+    session._unsloth_mcp_apps = True
+
+
+_MCP_APPS_CLIENT_CLASSES: dict = {}
+
+
+def _mcp_apps_client_class(base: Any) -> Any:
+    """``base`` (fastmcp's Client) with the MCP Apps extension in its handshake. Built
+    from whatever ``fastmcp.Client`` is at call time, so a stand-in keeps working."""
+    if not isinstance(base, type):
+        return base
+    cls = _MCP_APPS_CLIENT_CLASSES.get(base)
+    if cls is None:
+
+        class McpAppsClient(base):  # type: ignore[misc, valid-type]
+            async def initialize(self, *args, **kwargs):
+                _advertise_mcp_apps(getattr(self, "session", None))
+                return await super().initialize(*args, **kwargs)
+
+        cls = _MCP_APPS_CLIENT_CLASSES[base] = McpAppsClient
+    return cls
+
 def _local_decisions() -> bool:
     from core.systemone.catalog import parse_connection
     from utils.systemone_settings import get_model
@@ -580,7 +634,9 @@ def _client(
     use_oauth: bool = False,
 ):
     validate_mcp_address(url)
-    from fastmcp import Client
+    from fastmcp import Client as _BaseClient
+
+    Client = _mcp_apps_client_class(_BaseClient)
 
     if is_studio_decisions(url):
         from routes.systemone import decisions_mcp
@@ -1948,7 +2004,21 @@ def _call_session_tool(
     config_check,
     use_oauth: bool = False,
     dispatch = None,
+    serialize: bool = True,
 ) -> Any:
+    """Run one operation against a stdio server's persistent session.
+
+    ``dispatch`` (callable(client) -> coroutine) selects the operation, defaulting
+    to the tool call; a ui:// resource read reuses the same session this way.
+
+    ``serialize=False`` lets the call run alongside others on the session, as HTTP
+    calls always do. JSON-RPC multiplexes requests by id over stdio as well, so the
+    transport does not need the lock; the lock keeps the model's calls to a stateful
+    server (a browser, a REPL) in order. An MCP App widget issues its own calls
+    concurrently -- the published PDF viewer long-polls poll_pdf_commands for up to
+    30s while reading pages with read_pdf_bytes -- and queueing those behind each
+    other stalled every page turn until the poll came back.
+    """
     if cancel_event is not None and cancel_event.is_set():
         raise _MCPCancelled
     # One deadline covers the key-lock wait, connect, call-lock wait, and the call itself, matching the one-shot path
@@ -1984,7 +2054,7 @@ def _call_session_tool(
             # Serialize calls per session where the transport demands it: overlapping same-scope calls must not
             # interleave operations on one stateful stdio server (browser, REPL). HTTP multiplexes by request id, so
             # its calls run in parallel as they did one-shot.
-            if session.serialize_calls:
+            if session.serialize_calls and serialize:
                 while not session.call_lock.acquire(timeout = 0.05):
                     if cancel_event is not None and cancel_event.is_set():
                         raise _MCPCancelled
@@ -2208,7 +2278,7 @@ def _ui_request_sync(
     label,
     dispatch,
     *,
-    timeout,
+    timeout = 60.0,
     use_oauth = False,
     cancel_event = None,
     scope = None,
@@ -2226,7 +2296,9 @@ def _ui_request_sync(
     session_args = (url, headers, label, {}, timeout, cancel_event, scope, config_check, use_oauth)
     try:
         if is_stdio(url) or (scope and not use_oauth):
-            return _call_session_tool(*session_args, dispatch = dispatch)
+            # A widget's calls overlap by design (a long-poll beside page reads);
+            # see _call_session_tool.
+            return _call_session_tool(*session_args, dispatch = dispatch, serialize = False)
         return asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
     except _MCPCancelled as exc:
         raise TimeoutError(f"{label} was cancelled") from exc
