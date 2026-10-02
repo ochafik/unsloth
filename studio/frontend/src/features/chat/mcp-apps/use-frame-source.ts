@@ -19,6 +19,7 @@ import {
   newBridgeToken,
   withBridgeShim,
 } from "./bridge-shim";
+import { loadHostVersion } from "./host-version";
 import { cspFrameQuery } from "./mcp-ui";
 import {
   allowAttribute,
@@ -38,6 +39,9 @@ export function useFrameSource(
 
   useEffect(() => {
     let cancelled = false;
+    // Studio's version is what the widget is told it is hosted by; the template fetch
+    // below takes longer, so it is normally known by the time the bridge is made.
+    void loadHostVersion();
     setResource(null);
     setError(null);
     readMcpUiResource(serverId, resourceUri, { threadId, sessionId })
@@ -102,10 +106,11 @@ export function useFrameSource(
     if (sandboxOrigin) query.set("host", window.location.origin);
     // Never put the auth token in the URL: in-frame code reads location.href.
     if (sandboxOrigin) return `${sandboxOrigin}/?${query.toString()}`;
-    return apiUrl(
-      `/api/inference/mcp-app-frame${query.size ? `?${query.toString()}` : ""}`,
-    );
-  }, [resource, sandboxPort, sandboxOrigin]);
+    // The opaque fallback has no per-server listener: it is told which server this is,
+    // and the backend decides from that server's stored row what may be declared.
+    query.set("server_id", serverId);
+    return apiUrl(`/api/inference/mcp-app-frame?${query.toString()}`);
+  }, [resource, sandboxPort, sandboxOrigin, serverId]);
 
   // One token per fetched template, so re-seeding cannot be replayed either.
   const bridgeToken = useMemo(

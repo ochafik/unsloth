@@ -13,8 +13,10 @@ import type { McpUiResource } from "../api/mcp-servers-api";
  *  schemes (blob:, data:) reach nothing outside. */
 export function externalDomains(
   csp: McpUiResource["ui"]["csp"] | undefined,
+  blocked: readonly string[] = [],
 ): string[] {
   if (!csp) return [];
+  const refused = new Set(blocked.map((d) => d.trim()));
   const all = [
     ...(csp.connectDomains ?? []),
     ...(csp.resourceDomains ?? []),
@@ -27,9 +29,21 @@ export function externalDomains(
     const trimmed = value.trim();
     if (!trimmed || ["blob:", "data:"].includes(trimmed.toLowerCase()))
       continue;
+    // The backend dropped it from the frame's policy: the app cannot reach it.
+    if (refused.has(trimmed)) continue;
     hosts.add(trimmed.replace(/^[a-z]+:\/\//i, ""));
   }
   return [...hosts];
+}
+
+/** Declared hosts the host's policy refuses (private network, loopback on a remote
+ *  server ...), as told by the backend that enforces it. */
+export function blockedDomains(
+  resource: Pick<McpUiResource, "blocked_domains"> | null | undefined,
+): string[] {
+  return (resource?.blocked_domains ?? []).filter(
+    (d): d is string => typeof d === "string" && d.trim() !== "",
+  );
 }
 
 export type Permissions = NonNullable<McpUiResource["ui"]["permissions"]>;

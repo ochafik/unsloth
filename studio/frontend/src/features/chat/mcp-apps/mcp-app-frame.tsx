@@ -23,11 +23,11 @@ import { listenForViewPort } from "./bridge-shim";
 import { requestTeardown, retireFrame } from "./frame-lifecycle";
 import { registerLiveMcpApp } from "./live-apps";
 import { type McpUiEnvelope, toolApprovalScope } from "./mcp-ui";
-import { externalDomains } from "./permissions-csp";
+import { getHostVersion } from "./host-version";
+import { blockedDomains, externalDomains } from "./permissions-csp";
 import { usePendingPrompts } from "./pending-prompts";
 import { mcpAppToolKey } from "./tool-approval";
 import {
-  HOST_VERSION,
   type McpAppPhase,
   useAppBridge,
   useToolNotifications,
@@ -170,7 +170,7 @@ export function McpAppFrame({
     iframeRef,
     theme,
     ready,
-    hostVersion: HOST_VERSION,
+    hostVersion: getHostVersion(),
     push: bridge.pushHostContext,
   });
   hostRef.current = host;
@@ -318,7 +318,8 @@ export function McpAppFrame({
 
   const loading = !src || !html;
   const bordered = resource?.ui?.prefersBorder !== false;
-  const reaches = externalDomains(resource?.ui?.csp);
+  const blocked = blockedDomains(resource);
+  const reaches = externalDomains(resource?.ui?.csp, blocked);
   const fullscreen = displayMode === "fullscreen";
 
   return (
@@ -396,6 +397,14 @@ export function McpAppFrame({
           title={reaches.join(", ")}
         >
           This app can connect to {reaches.join(", ")}
+        </div>
+      ) : null}
+      {!fullscreen && blocked.length ? (
+        <div
+          className="mt-1 truncate text-ui-12p5 text-muted-foreground"
+          title={blocked.join(", ")}
+        >
+          Blocked by Studio: {blocked.join(", ")}
         </div>
       ) : null}
       {fullscreen ? null : prompts}

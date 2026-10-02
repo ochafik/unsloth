@@ -23,7 +23,6 @@ import {
   type McpUiHostContext,
 } from "@modelcontextprotocol/ext-apps/app-bridge";
 import { useCallback, useEffect, useRef, useState } from "react";
-import hostPackage from "../../../../package.json";
 import {
   McpUiApprovalRequired,
   callMcpUiTool,
@@ -37,6 +36,7 @@ import { clearMcpAppModelContext, setMcpAppModelContext } from "./model-context"
 import { PortTransport } from "./port-transport";
 import type { PromptController } from "./pending-prompts";
 import type { Permissions } from "./permissions-csp";
+import { getHostVersion } from "./host-version";
 import { parsePartialToolArgs } from "./streaming-args";
 import { MCP_APP_TOOL_DECLINED, mcpAppToolKey } from "./tool-approval";
 import {
@@ -48,9 +48,6 @@ import {
 /** Where the tool call this widget draws stands: arguments still streaming, its
  *  result arrived, or the call was stopped before it produced one. */
 export type McpAppPhase = "streaming" | "settled" | "cancelled";
-
-// Tracks the frontend package's own version, not a hand-stamped constant.
-export const HOST_VERSION: string = hostPackage.version;
 
 // The implementation-defined code the spec leaves for a request the host or the
 // user declined.
@@ -147,7 +144,7 @@ export function createViewSession(
   const first = getContext();
   const bridge = new AppBridge(
     null,
-    { name: HOST_NAME, version: HOST_VERSION },
+    { name: HOST_NAME, version: getHostVersion() },
     hostCapabilities(first),
     { hostContext: first.hostContext() },
   );

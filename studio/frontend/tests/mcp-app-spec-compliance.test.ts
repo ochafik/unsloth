@@ -141,7 +141,7 @@ test("the frame hands the view to the proxy the way the spec lays out", () => {
 test("the host answers what a view may ask, and nothing reaches it early", async () => {
   // The protocol is the SDK's AppBridge: it is constructed over the view's port, and
   // what it advertises is only what this host implements.
-  assert.match(bridgeSource, /new AppBridge\(\s*null,\s*\{ name: HOST_NAME, version: HOST_VERSION \}/);
+  assert.match(bridgeSource, /new AppBridge\(\s*null,\s*\{ name: HOST_NAME, version: getHostVersion\(\) \}/);
   const caps = bridgeSource.slice(
     bridgeSource.indexOf("function hostCapabilities("),
     bridgeSource.indexOf("function toCallToolResult("),
@@ -150,8 +150,11 @@ test("the host answers what a view may ask, and nothing reaches it early", async
     assert.match(caps, new RegExp(`${capability}: `), `${capability} is implemented`);
   }
   assert.match(caps, /ctx\.toolCallId\s*\?\s*\{\s*updateModelContext:/);
-  // The version is the package's, not a hand-stamped constant.
-  assert.match(bridgeSource, /HOST_VERSION: string = hostPackage\.version/);
+  // The version is Studio's own, from the existing /api/health -- not the frontend package's placeholder.
+  assert.doesNotMatch(bridgeSource, /package\.json/);
+  const hostVersionSource = readFileSync(new URL("../src/features/chat/mcp-apps/host-version.ts", import.meta.url), "utf8");
+  assert.match(hostVersionSource, /apiUrl\("\/api\/health"\)/);
+  assert.match(hostVersionSource, /studio_version/);
   // Display modes: never one the host lacks or the View did not declare (when it
   // declared any), and the resulting mode is always returned.
   assert.match(bridgeSource, /\(HOST_DISPLAY_MODES as readonly string\[\]\)\.includes\(requested\)/);
@@ -304,6 +307,22 @@ test("a retiring frame clears its model context, scoped to the thread it was set
     retire.indexOf("session.retire?.()") !== -1 &&
       retire.indexOf("session.retire?.()") < retire.indexOf("parkFrame(frame)"),
     "context is cleared before the frame is parked, whichever way it goes",
+  );
+});
+
+test("the caption lists what the backend left in the policy and names what it dropped", () => {
+  const csp = { connectDomains: ["api.example.com", "localhost:11434", "http://10.0.0.5"] };
+  assert.deepEqual(externalDomains(csp), ["api.example.com", "localhost:11434", "10.0.0.5"]);
+  assert.deepEqual(externalDomains(csp, ["localhost:11434", "http://10.0.0.5"]), ["api.example.com"]);
+  assert.match(text, /blocked\.length/);
+  assert.match(text, /Blocked by Studio/);
+});
+
+test("the opaque fallback frame is told which server it is for", () => {
+  assert.match(frameSource, /query\.set\("server_id", serverId\)/);
+  // Only the fallback: the sandbox listener already knows its server.
+  assert.ok(
+    frameSource.indexOf("return `${sandboxOrigin}/?") < frameSource.indexOf('query.set("server_id"'),
   );
 });
 
