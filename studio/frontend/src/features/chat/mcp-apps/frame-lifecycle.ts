@@ -6,8 +6,6 @@
 
 import type { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
 
-// How a widget being torn down may take to answer ui/resource-teardown.
-export const TEARDOWN_GRACE_MS = 3_000;
 // How long a parked frame keeps serving after its card re-keyed. The successor
 // card intermittently does not re-mount, and the parked document is then the
 // only thing still polling its server and rendering pages; killing it at once
