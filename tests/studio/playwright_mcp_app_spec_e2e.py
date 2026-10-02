@@ -376,14 +376,27 @@ def run(page: Page, model: FakeToolModel, recorder: OriginRecorder, events: Path
     wait_until(lambda: len(model.requests) > before, 30, "the fullscreen chat's turn")
     last_user = [m for m in model.requests[-1]["messages"] if m.get("role") == "user"][-1]
     check("what page is it on?" in json.dumps(last_user.get("content")), "the fullscreen chat bar sent an ordinary user turn")
-    # The widget's last update before this message was captured onto it: the note
-    # ahead of the user's text, and the image with it, as this turn's own parts.
-    check(MODEL_CONTEXT_MARK in json.dumps(last_user.get("content")) and "[State of the show_probe app" in json.dumps(last_user.get("content")),
-          "the widget's state rode the message it preceded, as a note ahead of the text")
-    check(isinstance(last_user.get("content"), list) and any(p.get("type") == "image_url" and PIXEL in json.dumps(p) for p in last_user["content"]),
-          "its image came with that message as image input")
-    captured_note = next(p["text"] for p in last_user["content"] if p.get("type") == "text")
-    (ART / "captured-message.json").write_text(json.dumps(last_user, indent = 1))
+    # The widget's last update before this message is the result of a synthetic
+    # read_widget_context call placed ahead of it: labelled as untrusted data, the image
+    # in the tool result's own envelope, and the user's turn left exactly as typed.
+    messages = model.requests[-1]["messages"]
+    ctx_calls = widget_context_pairs(messages)
+    check(len(ctx_calls) == 1, f"one read_widget_context call/result pair preceded the message ({len(ctx_calls)})")
+    ctx_call, ctx_result = ctx_calls[0]
+    check(messages.index(ctx_result) < messages.index(last_user) and messages.index(ctx_call) == messages.index(ctx_result) - 1,
+          "the pair sits directly ahead of the user's message")
+    result_text = json.dumps(ctx_result.get("content"))
+    check(MODEL_CONTEXT_MARK in result_text and "[State of the show_probe app" in result_text and "Untrusted data" in result_text,
+          "the widget's state came back as untrusted-labelled tool output")
+    # An external provider reads no image inside a tool message, so the host hands it over
+    # as the image input of the turn straight after the result, as for any tool picture.
+    check(isinstance(last_user.get("content"), list)
+          and any(p.get("type") == "image_url" and PIXEL in json.dumps(p) for p in last_user["content"]),
+          "its image came with it, as image input right after the result")
+    check(MODEL_CONTEXT_MARK not in json.dumps(last_user.get("content")),
+          "the user's own turn carries none of the widget's state")
+    captured_note = result_text
+    (ART / "captured-message.json").write_text(json.dumps([ctx_call, ctx_result, last_user], indent = 1))
     expect(page.locator('[data-slot="mcp-app-fullscreen-chat"]')).to_contain_text("what page is it on?", timeout = 30_000)
     check(True, "its reply shows above the bar, still in fullscreen")
     check(holder.get_attribute("data-display-mode") == "fullscreen", "the widget stayed fullscreen through the turn")
@@ -402,19 +415,15 @@ def run(page: Page, model: FakeToolModel, recorder: OriginRecorder, events: Path
     check(not any(name.endswith(("app_echo", "save_state")) for name in offered),
           "the model was not offered the app-only tools")
 
-    # 8. The widget's last model-context update rides the tool result next turn.
+    # 8. The pair is replayed byte for byte, and nothing new is captured without an update.
     before = len(model.requests)
     send(page, "what does the probe show now?")
     wait_until(lambda: len(model.requests) > before, 60, "the follow-up turn")
     history = model.requests[-1]["messages"]
-    users = [m for m in history if m.get("role") == "user"]
-    check("[State of" not in json.dumps(users[-1].get("content")), "no update since: the new message carries nothing")
-    check(any(captured_note == (p.get("text") if isinstance(p, dict) else None) or captured_note == c
-              for m in users for c in [m.get("content")] for p in (c if isinstance(c, list) else [c])),
-          "the earlier turn replays its note byte for byte")
+    pairs = widget_context_pairs(history)
+    check(len(pairs) == 1, f"no update since: the new message adds no pair ({len(pairs)})")
+    check(json.dumps(pairs[0][1].get("content")) == captured_note, "the earlier pair replays byte for byte")
     check(PIXEL not in json.dumps(history), "the earlier turn's image is not uploaded again")
-    check(not any(MODEL_CONTEXT_MARK in str(m.get("content")) for m in history if m.get("role") == "tool"),
-          "no tool result carries widget state: history is append-only")
     page.wait_for_function(
         "() => !document.querySelector('button[aria-label=\"Stop generating\"]')",
         timeout = 60_000,
@@ -534,8 +543,24 @@ def run_fallback(page: Page, thread_url: str, model: FakeToolModel | None = None
         wait_until(lambda: len(model.requests) > before, 60, "the turn after the reload")
         users = [m for m in model.requests[-1]["messages"] if m.get("role") == "user"]
         check("[State of" not in json.dumps(users[-1].get("content")), "after a reload, unchanged state adds nothing")
-        check(any("[State of the show_probe app" in json.dumps(m.get("content")) for m in users[:-1]),
-              "after a reload, the earlier turn still carries its note (persisted)")
+        pairs = widget_context_pairs(model.requests[-1]["messages"])
+        check(len(pairs) == 1 and "[State of the show_probe app" in json.dumps(pairs[0][1].get("content")),
+              "after a reload, the earlier read_widget_context pair is still there (persisted), and no second one")
+
+
+def widget_context_pairs(messages: list) -> list:
+    """(assistant call, tool result) for each synthetic read_widget_context exchange."""
+    out = []
+    for i, m in enumerate(messages):
+        for call in m.get("tool_calls") or []:
+            if (call.get("function") or {}).get("name", "").endswith("read_widget_context"):
+                result = next(
+                    (r for r in messages[i + 1 :] if r.get("role") == "tool" and r.get("tool_call_id") == call.get("id")),
+                    None,
+                )
+                if result is not None:
+                    out.append((m, result))
+    return out
 
 
 def main() -> int:
