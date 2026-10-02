@@ -564,27 +564,50 @@ MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
 
 
-def _advertise_mcp_apps(session: Any) -> None:
-    """Add the MCP Apps extension to this session's initialize request.
+def _extension_advertiser() -> Any:
+    """``mcp.client.advertise`` where the SDK has first-class client extensions (mcp 2.x,
+    fastmcp 4: ``Client(extensions=[...])``), else None."""
+    try:
+        from mcp.client.extension import advertise
 
-    The SDK's ClientSession builds its capabilities itself and has no parameter for
+        return advertise
+    except ImportError:
+        return None
+
+
+def _advertise_mcp_apps(session: Any) -> None:
+    """Add the MCP Apps extension to this session's initialize request (mcp 1.x).
+
+    The 1.x ClientSession builds its capabilities itself and has no parameter for
     extensions, so the request is amended on its way out. ClientCapabilities allows
-    extra fields and serializes them, which is exactly where the extension lives."""
+    extra fields and serializes them, which is exactly where the extension lives. mcp
+    2.x has a public API for this (see `_extension_advertiser`) and does not come here."""
     if session is None or getattr(session, "_unsloth_mcp_apps", False):
         return
     import mcp.types as mcp_types
 
     send = session.send_request
+    failed = []
 
     async def send_request(request, *args, **kwargs):
         root = getattr(request, "root", None)
         if isinstance(root, mcp_types.InitializeRequest):
-            caps = root.params.capabilities
-            fields = caps.model_dump(by_alias = True, exclude_none = True)
-            extensions = dict(fields.get("extensions") or {})
-            extensions.setdefault(MCP_APPS_EXTENSION_ID, {"mimeTypes": [MCP_APP_MIME_TYPE]})
-            fields["extensions"] = extensions
-            root.params.capabilities = mcp_types.ClientCapabilities.model_validate(fields)
+            try:
+                caps = root.params.capabilities
+                fields = caps.model_dump(by_alias = True, exclude_none = True)
+                extensions = dict(fields.get("extensions") or {})
+                extensions.setdefault(MCP_APPS_EXTENSION_ID, {"mimeTypes": [MCP_APP_MIME_TYPE]})
+                fields["extensions"] = extensions
+                root.params.capabilities = mcp_types.ClientCapabilities.model_validate(fields)
+            except Exception:  # noqa: BLE001
+                if not failed:
+                    failed.append(True)
+                    logger.error(
+                        "Could not advertise the MCP Apps extension in the MCP handshake: "
+                        "servers will not offer UI widgets to Studio. This mcp SDK version "
+                        "is not supported by _advertise_mcp_apps.",
+                        exc_info = True,
+                    )
         return await send(request, *args, **kwargs)
 
     session.send_request = send_request
@@ -596,19 +619,47 @@ _MCP_APPS_CLIENT_CLASSES: dict = {}
 
 def _mcp_apps_client_class(base: Any) -> Any:
     """``base`` (fastmcp's Client) with the MCP Apps extension in its handshake. Built
-    from whatever ``fastmcp.Client`` is at call time, so a stand-in keeps working."""
+    from whatever ``fastmcp.Client`` is at call time, so a stand-in keeps working.
+
+    With first-class extensions (``Client(extensions=[...])``) that is the public API;
+    otherwise the 1.x handshake amendment of `_advertise_mcp_apps`."""
     if not isinstance(base, type):
         return base
     cls = _MCP_APPS_CLIENT_CLASSES.get(base)
     if cls is None:
+        import inspect
 
-        class McpAppsClient(base):  # type: ignore[misc, valid-type]
-            async def initialize(self, *args, **kwargs):
-                _advertise_mcp_apps(getattr(self, "session", None))
-                return await super().initialize(*args, **kwargs)
+        advertise = _extension_advertiser()
+        try:
+            native = advertise is not None and "extensions" in inspect.signature(base.__init__).parameters
+        except (TypeError, ValueError):
+            native = False
+
+        if native:
+
+            class McpAppsClient(base):  # type: ignore[misc, valid-type]
+                def __init__(self, *args, extensions = None, **kwargs):
+                    extensions = list(extensions or [])
+                    extensions.append(
+                        advertise(MCP_APPS_EXTENSION_ID, {"mimeTypes": [MCP_APP_MIME_TYPE]})
+                    )
+                    super().__init__(*args, extensions = extensions, **kwargs)
+
+        else:
+            if advertise is not None:
+                logger.warning(
+                    "fastmcp.Client has no extensions= parameter although mcp has client "
+                    "extensions; falling back to amending the handshake."
+                )
+
+            class McpAppsClient(base):  # type: ignore[misc, valid-type]
+                async def initialize(self, *args, **kwargs):
+                    _advertise_mcp_apps(getattr(self, "session", None))
+                    return await super().initialize(*args, **kwargs)
 
         cls = _MCP_APPS_CLIENT_CLASSES[base] = McpAppsClient
     return cls
+
 
 def _local_decisions() -> bool:
     from core.systemone.catalog import parse_connection
