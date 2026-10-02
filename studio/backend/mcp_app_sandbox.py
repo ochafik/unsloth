@@ -53,6 +53,9 @@ _locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 class _Listener:
     def __init__(self, server: Any, task: "asyncio.Task", sock: socket.socket, port: int):
+        # {"allow_local": bool}: read per request, refreshed whenever the route is asked
+        # for the port, so an edited server URL takes effect without a restart.
+        self.policy: dict = {"allow_local": False}
         self.server = server
         self.task = task
         self.socket = sock
@@ -210,7 +213,7 @@ def allowed_host_origin(host_origin: str, request_host: str, primary_port: Optio
 # --- the listener app ----------------------------------------------------------
 
 
-def _handle(scope: dict, primary_port: Optional[int]):
+def _handle(scope: dict, primary_port: Optional[int], policy: Optional[dict] = None):
     if scope.get("method") not in ("GET", "HEAD") or scope.get("path") != "/":
         return (404, b"Not found", [(b"content-type", b"text/plain; charset=utf-8")])
     query = urllib.parse.parse_qs(scope.get("query_string", b"").decode("latin-1"))
@@ -230,11 +233,15 @@ def _handle(scope: dict, primary_port: Optional[int]):
 
     from routes.inference import _mcp_app_csp, _mcp_app_domains
 
+    # Whether this listener's server is itself local is the server's own fact, set from
+    # its stored row by the route -- never from the query, which the page builds from
+    # what the server declared.
+    local = bool((policy or {}).get("allow_local"))
     csp = _mcp_app_csp(
-        _mcp_app_domains(one("connect")),
-        _mcp_app_domains(one("resource")),
-        _mcp_app_domains(one("frame")),
-        _mcp_app_domains(one("base_uri"), local_schemes = False),
+        _mcp_app_domains(one("connect"), allow_local = local),
+        _mcp_app_domains(one("resource"), allow_local = local),
+        _mcp_app_domains(one("frame"), allow_local = local),
+        _mcp_app_domains(one("base_uri"), local_schemes = False, allow_local = local),
         # 'self' too: a document the View makes (a blob: frame, say) inherits this
         # policy, and its ancestors then include this origin. WebKit enforces that.
         frame_ancestors = f"{host_origin} 'self'",
@@ -260,11 +267,11 @@ def _handle(scope: dict, primary_port: Optional[int]):
     )
 
 
-def _sandbox_app(primary_port: Optional[int]):
+def _sandbox_app(primary_port: Optional[int], policy: Optional[dict] = None):
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return
-        status, body, headers = _handle(scope, primary_port)
+        status, body, headers = _handle(scope, primary_port, policy)
         headers = [*headers, (b"content-length", str(len(body)).encode())]
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": b"" if scope.get("method") == "HEAD" else body})
@@ -284,10 +291,25 @@ def _ports_path() -> Optional[Path]:
         return None
 
 
+_ports_cache: Optional[dict] = None
+_ports_cache_path: Optional[Path] = None
+_MAX_FRAME_ORIGINS = 64
+
+
 def _load_ports() -> dict:
+    global _ports_cache, _ports_cache_path
     path = _ports_path()
     if path is None:
         return {}
+    # Every Studio response asks (for its frame-src), so read the file once per path.
+    if _ports_cache is not None and _ports_cache_path == path:
+        return dict(_ports_cache)
+    _ports_cache = _read_ports(path)
+    _ports_cache_path = path
+    return dict(_ports_cache)
+
+
+def _read_ports(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding = "utf-8"))
     except (OSError, ValueError):
@@ -307,6 +329,50 @@ def _remember_port(server_id: str, port: int) -> None:
     if ports.get(server_id) == port:
         return
     ports[server_id] = port
+    _write_ports(path, ports)
+
+
+def forget_port(server_id: str) -> None:
+    """Drop a deleted server's port, so the page policy stops naming it."""
+    path = _ports_path()
+    if path is None:
+        return
+    ports = _load_ports()
+    if ports.pop(server_id, None) is not None:
+        _write_ports(path, ports)
+
+
+def reserve_port(server_id: str) -> None:
+    """Give a new server a remembered port before its first widget.
+
+    The Studio page's CSP can only name ports that exist when the page is served; a
+    port picked at first use would be blocked until the next page load. A reservation
+    is found by binding port 0 and releasing it (it is only a preference: if something
+    takes it meanwhile, ensure_sandbox_port picks another and the opaque fallback
+    covers the widget until the page reloads). Never raises."""
+    if not _SERVER_ID_RE.match(server_id or "") or server_id in _load_ports():
+        return
+    try:
+        probe = _bind("127.0.0.1", 0)
+        port = probe.getsockname()[1]
+        probe.close()
+    except OSError:
+        return
+    _remember_port(server_id, port)
+
+
+def frame_origins(hostname: str) -> list:
+    """Exact ``http://<hostname>:<port>`` origins of every remembered sandbox port.
+
+    This is what the Studio page's ``frame-src`` lists, in place of any port. Sorted
+    and capped so the header stays bounded."""
+    return [f"http://{hostname}:{port}" for port in sorted(set(_load_ports().values()))[:_MAX_FRAME_ORIGINS]]
+
+
+def _write_ports(path: Path, ports: dict) -> None:
+    global _ports_cache, _ports_cache_path
+    _ports_cache = dict(ports)
+    _ports_cache_path = path
     try:
         path.parent.mkdir(parents = True, exist_ok = True)
         tmp = path.with_suffix(".tmp")
@@ -344,7 +410,9 @@ def _used_ports(address: str) -> set:
     return {listener.port for (addr, _), listener in _listeners.items() if addr == address}
 
 
-async def ensure_sandbox_port(local_address: str, server_id: str, primary_port: Optional[int]) -> int:
+async def ensure_sandbox_port(
+    local_address: str, server_id: str, primary_port: Optional[int], allow_local: bool = False
+) -> int:
     """The sandbox port for ``server_id`` on ``local_address``, started if needed.
 
     Must run on the primary server's event loop (an async route does)."""
@@ -358,6 +426,7 @@ async def ensure_sandbox_port(local_address: str, server_id: str, primary_port: 
     async with lock:
         live = _listeners.get(key)
         if live is not None and not live.task.done():
+            live.policy["allow_local"] = allow_local
             return live.port
 
         remembered = _load_ports().get(server_id)
@@ -373,8 +442,9 @@ async def ensure_sandbox_port(local_address: str, server_id: str, primary_port: 
 
         from utils.uvicorn_h11_shutdown import uvicorn_http_protocol
 
+        policy = {"allow_local": allow_local}
         config = uvicorn.Config(
-            _sandbox_app(primary_port),
+            _sandbox_app(primary_port, policy),
             host = address,
             port = port,
             # a second lifespan would re-fire the app's startup handlers
@@ -399,6 +469,7 @@ async def ensure_sandbox_port(local_address: str, server_id: str, primary_port: 
             raise RuntimeError("the MCP App sandbox listener did not start")
 
         _listeners[key] = _Listener(server, task, sock, port)
+        _listeners[key].policy = policy
         _remember_port(server_id, port)
         logger.info("MCP App sandbox for %s listening on %s:%s", server_id, address, port)
         return port
