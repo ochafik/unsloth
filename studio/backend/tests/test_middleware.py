@@ -1586,14 +1586,21 @@ def test_health_reports_the_default_for_a_settings_saved_endpoint(main_module, m
 
 
 class TestMcpAppSandboxFrameSource:
+    @pytest.fixture(autouse = True)
+    def _ports(self, tmp_path, monkeypatch):
+        import mcp_app_sandbox
+
+        monkeypatch.setattr(mcp_app_sandbox, "_ports_path", lambda: tmp_path / "ports.json")
+        mcp_app_sandbox._remember_port("a", 40001)
+        mcp_app_sandbox._remember_port("b", 40002)
+
     @pytest.mark.parametrize(
         "host, expected",
         [
-            ("127.0.0.1:8888", "http://127.0.0.1:*"),
-            ("localhost:8888", "http://localhost:*"),
-            ("192.168.1.5:8888", "http://192.168.1.5:*"),
-            ("studio.local", "http://studio.local:*"),
-            ("[::1]:8888", "http://[::1]:*"),
+            ("127.0.0.1:8888", "http://127.0.0.1:40001 http://127.0.0.1:40002"),
+            ("localhost:8888", "http://localhost:40001 http://localhost:40002"),
+            ("192.168.1.5:8888", "http://192.168.1.5:40001 http://192.168.1.5:40002"),
+            ("[::1]:8888", "http://[::1]:40001 http://[::1]:40002"),
             (None, ""),
             ("", ""),
             # Anything that could reach another directive is dropped, not echoed.
@@ -1604,9 +1611,19 @@ class TestMcpAppSandboxFrameSource:
     def test_frame_source(self, main_module, host, expected):
         assert main_module._mcp_app_frame_source(host) == expected
 
+    def test_never_a_port_wildcard(self, main_module):
+        assert ":*" not in main_module._build_csp("N", host = "127.0.0.1:8888")
+
+    def test_a_forgotten_server_leaves_the_policy(self, main_module):
+        import mcp_app_sandbox
+
+        mcp_app_sandbox.forget_port("a")
+        assert main_module._mcp_app_frame_source("h:1") == "http://h:40002"
+
     def test_policy_names_it_only_when_a_host_is_known(self, main_module):
         assert "frame-src 'self'; " in main_module._build_csp("N")
         with_host = main_module._build_csp("N", host = "127.0.0.1:8888")
-        assert "frame-src 'self' http://127.0.0.1:*; " in with_host
+        origins = "http://127.0.0.1:40001 http://127.0.0.1:40002"
+        assert f"frame-src 'self' {origins}; " in with_host
         # Nothing else in the policy moves.
-        assert with_host.replace(" http://127.0.0.1:*", "") == main_module._build_csp("N")
+        assert with_host.replace(f" {origins}", "") == main_module._build_csp("N")

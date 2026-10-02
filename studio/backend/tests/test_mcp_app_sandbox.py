@@ -178,3 +178,50 @@ def test_the_route_starts_a_listener_on_the_address_the_request_arrived_on(monke
         scope = {}
 
     assert asyncio.run(routes_mcp.mcp_app_sandbox(NoServer(), "srv-r", via_api_key = False)).port is None
+
+
+def test_reserved_port_is_remembered_listed_and_forgotten():
+    sandbox.reserve_port("srv-r")
+    port = sandbox._load_ports()["srv-r"]
+    assert 1024 <= port <= 65535
+    assert sandbox.frame_origins("h") == [f"http://h:{port}"]
+    # A reservation is not replaced by a second one.
+    sandbox.reserve_port("srv-r")
+    assert sandbox._load_ports()["srv-r"] == port
+    sandbox.forget_port("srv-r")
+    assert sandbox.frame_origins("h") == []
+
+
+def test_reserved_port_is_the_one_first_use_binds():
+    async def go():
+        try:
+            sandbox.reserve_port("srv-u")
+            reserved = sandbox._load_ports()["srv-u"]
+            return reserved, await sandbox.ensure_sandbox_port("127.0.0.1", "srv-u", primary_port = 8888)
+        finally:
+            await sandbox.close_sandbox_listeners()
+
+    reserved, port = asyncio.run(go())
+    assert port == reserved
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_the_listener_policy_decides_whether_loopback_may_be_declared(local):
+    async def go():
+        try:
+            port = await sandbox.ensure_sandbox_port(
+                "127.0.0.1", "srv-l", primary_port = 8888, allow_local = local
+            )
+            host = "http://127.0.0.1:8888"
+            return await asyncio.to_thread(
+                _get,
+                f"http://127.0.0.1:{port}/?host={host}&connect=localhost:11434,api.example.com,192.168.1.5",
+            )
+        finally:
+            await sandbox.close_sandbox_listeners()
+
+    status, headers, _ = asyncio.run(go())
+    csp = [v for k, v in headers.items() if k.lower() == "content-security-policy"][0]
+    connect = csp.split("connect-src ")[1].split(";")[0]
+    assert status == 200
+    assert connect == ("localhost:11434 api.example.com" if local else "api.example.com")

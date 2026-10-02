@@ -285,6 +285,44 @@ def test_csp_defaults_to_deny_and_declared_domains_widen_only_their_directive():
     assert [parse(v) for v in bad] == [[]] * len(bad)
 
 
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "localhost", "localhost:11434", "http://localhost:11434", "foo.localhost", "127.0.0.1",
+        "127.1", "0x7f.0.0.1", "2130706433", "10.0.0.5", "172.16.0.1", "192.168.1.5",
+        "100.64.0.1", "169.254.169.254", "0.0.0.0", "*.192.168.1.5", "*.com", "*.org", "com",
+        "*.co.uk", "*.com.au", "*.github.io", "*.herokuapp.com", "nas.local", "printer.lan",
+        "db.internal", "myhost", "*.local",
+    ],
+)  # fmt: skip
+def test_declared_domains_naming_the_users_network_or_a_suffix_are_dropped(declared):
+    from routes.inference import _mcp_app_domains as parse
+
+    assert parse(declared) == []
+    assert parse(f"{declared}, api.example.com") == ["api.example.com"]
+
+
+@pytest.mark.parametrize(
+    "declared",
+    ["localhost", "localhost:11434", "http://127.0.0.1:8080", "foo.localhost", "127.0.0.1"],
+)
+def test_a_local_server_may_declare_loopback_only(declared):
+    from routes.inference import _mcp_app_domains as parse
+
+    assert parse(declared, allow_local = True) == [declared]
+    # Never the LAN, never a wildcard over loopback, even for a local server.
+    for lan in ("10.0.0.5", "192.168.1.5", "169.254.169.254", "nas.local", "*.localhost", "*.com"):
+        assert parse(lan, allow_local = True) == []
+
+
+def test_legitimate_public_hosts_still_pass():
+    from routes.inference import _mcp_app_domains as parse
+
+    ok = ["api.example.com", "https://tile.openstreetmap.org", "*.cdn.example.com",
+          "wss://stream.example.io:8443", "*.example.co.uk", "unpkg.com", "my-app.github.io"]  # fmt: skip
+    assert parse(",".join(ok)) == ok
+
+
 _DASH = {"name": "dashboard", "meta": {"ui": {"resourceUri": UI}}}
 _APP = {"name": "get_stats", "meta": {"ui": {"visibility": ["app"]}}}
 _WRITE = {"name": "delete_item", "meta": {"ui": {"visibility": ["app"]}}}

@@ -370,6 +370,10 @@ async def create_mcp_server(
         use_oauth = use_oauth,
         image_input_mappings_json = _mappings_json(payload.image_input_mappings),
     )
+    # So the Studio page's frame-src can name this server's sandbox origin next load.
+    from mcp_app_sandbox import reserve_port
+
+    reserve_port(server_id)
     return _row_to_response(mcp_servers_db.get_server(server_id))
 
 
@@ -480,6 +484,9 @@ async def delete_mcp_server(server_id: str, current_subject: str = Depends(get_c
     if old.get("use_oauth"):
         await clear_oauth_tokens_async(old["url"])
     mcp_servers_db.delete_server(server_id)
+    from mcp_app_sandbox import forget_port
+
+    forget_port(server_id)
     invalidate_tool_cache(server_id)
     await asyncio.to_thread(close_mcp_sessions, old["url"], parse_server_headers(old))
 
@@ -709,6 +716,27 @@ def _ui_call_kwargs(server_id: str, server: dict, thread_id, session_id) -> dict
     }
 
 
+def _server_is_local(server: dict) -> bool:
+    """A stdio command, or a URL on this machine's loopback."""
+    url = server.get("url") or ""
+    if is_stdio(url):
+        return True
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 @router.get("/app-sandbox", response_model = McpAppSandboxResponse)
 async def mcp_app_sandbox(
     request: Request,
@@ -722,14 +750,20 @@ async def mcp_app_sandbox(
     a listener on another port of the very address this request arrived on, which
     is an address the caller can already reach. None means the frame falls back to
     an opaque-origin sandbox."""
-    _ui_server_or_404(server_id, via_api_key)
+    server = _ui_server_or_404(server_id, via_api_key)
     local = request.scope.get("server")
     if not local or not local[0]:
         return McpAppSandboxResponse(port = None)
     from mcp_app_sandbox import ensure_sandbox_port
 
     try:
-        port = await ensure_sandbox_port(str(local[0]), server_id, primary_port = local[1])
+        port = await ensure_sandbox_port(
+            str(local[0]),
+            server_id,
+            primary_port = local[1],
+            # A local server's widget may declare loopback APIs (Ollama, a dev server).
+            allow_local = _server_is_local(server),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("mcp_servers.app_sandbox_unavailable", error = str(exc))
         return McpAppSandboxResponse(port = None)
@@ -813,7 +847,7 @@ async def call_mcp_ui_tool(
         is_potentially_unsafe_tool_call,
         mcp_tool_definition,
     )
-    from state.tool_policy import get_tool_policy
+    from state.tool_policy import get_tool_policy, require_tool_access
 
     if get_tool_policy() is False:
         raise HTTPException(status_code = 403, detail = "Tools are disabled on this server")
@@ -835,7 +869,16 @@ async def call_mcp_ui_tool(
     arguments = payload.arguments or {}
     if _mcp_arguments_reference_studio_credential(arguments):
         raise HTTPException(status_code = 403, detail = _STUDIO_CREDENTIAL_BLOCKED)
+    # Trust model: Studio keeps no server-side permission setting per chat or account.
+    # ``permission_mode`` and ``approved`` come from the Studio frontend, exactly as the
+    # chat route's own ``permission_mode`` does, and the frontend is the user's own
+    # session (authenticated above). The widget itself cannot reach this route: it runs
+    # on another origin with no credentials and can only post messages to the host
+    # frame, which shows the confirm dialog. So these fields are the user's consent,
+    # not widget input. Enforced server-side regardless: the tool policy above, "app"
+    # visibility, the credential-reference check, and the "full" mode gate below.
     mode = payload.permission_mode
+    require_tool_access(mode)
     # An unstated or unknown mode asks; "auto" asks only for what the model's call would be asked for.
     needs_approval = mode not in ("off", "full") and (
         mode != "auto"

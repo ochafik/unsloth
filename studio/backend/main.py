@@ -1121,12 +1121,16 @@ def _reportable_hf_endpoints(request) -> dict:
 
 
 def _mcp_app_frame_source(host_header: "str | None") -> str:
-    """Any port of the hostname this page was requested on, or "" when there is none.
+    """The exact sandbox-proxy origins this page may frame, or "" when there are none.
 
-    MCP App widgets are rendered through a sandbox proxy on another port of that same
-    host (mcp_app_sandbox.py: the spec requires the proxy's origin to differ from the
-    host's), and ``'self'`` never matches another port. The ports are started on first
-    use, after this page's policy is fixed, so the port itself cannot be named."""
+    MCP App widgets are rendered through a sandbox proxy on another port of the host
+    the page was requested on (mcp_app_sandbox.py: the spec requires the proxy's origin
+    to differ from the host's), and ``'self'`` never matches another port. Each UI
+    server's port is remembered (and reserved when the server is created), so the
+    policy names those origins instead of every port of the host. A server added after
+    this page loaded has a port this policy does not list: the browser blocks that
+    frame, the proxy never answers, and the widget falls back to the opaque-origin
+    sandbox until the page is reloaded."""
     if not host_header:
         return ""
     try:
@@ -1137,7 +1141,9 @@ def _mcp_app_frame_source(host_header: "str | None") -> str:
         return ""
     if ":" in hostname:
         hostname = f"[{hostname}]"
-    return f"http://{hostname}:*"
+    from mcp_app_sandbox import frame_origins
+
+    return " ".join(frame_origins(hostname))
 
 
 def _build_csp(

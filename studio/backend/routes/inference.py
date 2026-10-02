@@ -70,6 +70,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, fields as dataclass_fields, replace
 
 
+import ipaddress as _ipaddress
 import re as _re
 from urllib.parse import quote as _urlquote
 
@@ -4235,10 +4236,90 @@ _MCP_APP_MAX_DOMAINS = 24
 _MCP_APP_LOCAL_SCHEMES = frozenset({"blob:", "data:"})
 
 
-def _mcp_app_domains(raw: Optional[str], local_schemes: bool = True) -> list:
+# Names that only resolve on the user's own network or machine.
+_MCP_APP_PRIVATE_SUFFIXES = (
+    ".localhost", ".local", ".localdomain", ".internal", ".intranet", ".lan", ".home", ".corp",
+    ".home.arpa", ".private",
+)  # fmt: skip
+# Public suffixes a wildcard must not sit directly on: "*.github.io" names every tenant of
+# the host. Not the full Public Suffix List (no dependency for it), but the multi-label
+# country suffixes and the shared hosting domains a declared API realistically falls on.
+_MCP_APP_SHARED_SUFFIXES = frozenset(
+    """github.io gitlab.io githubusercontent.com herokuapp.com vercel.app netlify.app pages.dev
+    workers.dev web.app firebaseapp.com appspot.com cloudfront.net amazonaws.com azurewebsites.net
+    blogspot.com wordpress.com ngrok.io ngrok-free.app trycloudflare.com onrender.com fly.dev
+    glitch.me repl.co replit.app surge.sh s3.amazonaws.com cloudapp.azure.com run.app
+    hf.space huggingface.co""".split()
+)
+_MCP_APP_SLD_LABELS = frozenset("co com org net gov edu ac or ne go gob nom mil".split())
+
+
+def _mcp_app_split_host(candidate: str) -> tuple:
+    """(host, wildcard) of a validated declared domain, lowercased, scheme/port dropped."""
+    host = candidate.lower()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.rsplit(":", 1)[0] if _re.search(r":[0-9]+$", host) else host
+    wildcard = host.startswith("*.")
+    return (host[2:] if wildcard else host), wildcard
+
+
+def _mcp_app_is_ip_literal(host: str) -> bool:
+    """A dotted quad, or any spelling a browser's URL parser reads as an IPv4 address
+    (``2130706433``, ``0x7f.1``, ``127.1``): a final label that is a number."""
+    last = host.rsplit(".", 1)[-1]
+    if last.isdigit() or last.startswith("0x"):
+        return True
+    try:
+        _ipaddress.ip_address(host.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _mcp_app_loopback_host(host: str) -> bool:
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return _ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _mcp_app_host_refusal(candidate: str, allow_local: bool) -> Optional[str]:
+    """Why a declared domain may not widen the CSP, or None.
+
+    A declared host is chosen by the MCP server's author. Allowing it to name the
+    user's loopback, LAN, a link-local metadata address or a whole public suffix turns
+    a widget into a probe of the user's network (SSRF from the browser), so those are
+    refused. An MCP server that is itself local (stdio, or a loopback URL) may name
+    loopback -- it is already on the machine -- but never the rest of the LAN."""
+    host, wildcard = _mcp_app_split_host(candidate)
+    if _mcp_app_loopback_host(host):
+        return None if (allow_local and not wildcard) else "loopback"
+    if _mcp_app_is_ip_literal(host):
+        return "IP literal"
+    if any(host.endswith(suffix) for suffix in _MCP_APP_PRIVATE_SUFFIXES):
+        return "private network name"
+    labels = host.split(".")
+    if len(labels) < 2:
+        return "bare TLD or single-label host"
+    if wildcard:
+        if host in _MCP_APP_SHARED_SUFFIXES:
+            return "wildcard over a shared public suffix"
+        if len(labels) == 2 and labels[0] in _MCP_APP_SLD_LABELS and len(labels[1]) == 2:
+            return "wildcard over a public suffix"
+    return None
+
+
+def _mcp_app_domains(
+    raw: Optional[str], local_schemes: bool = True, allow_local: bool = False
+) -> list:
     """Parse a comma-separated declared-domain list into CSP source tokens.
     Anything that is not a host is dropped rather than echoed: these arrive from
-    the browser and go straight into a response header."""
+    the browser and go straight into a response header. Hosts that name the user's own
+    network or a public suffix are dropped too (see _mcp_app_host_refusal) and logged;
+    ``allow_local`` is for a server that itself runs locally and admits loopback only."""
     if not raw:
         return []
     out = []
@@ -4249,7 +4330,11 @@ def _mcp_app_domains(raw: Optional[str], local_schemes: bool = True) -> list:
         if local_schemes and candidate.lower() in _MCP_APP_LOCAL_SCHEMES:
             out.append(candidate.lower())
         elif _MCP_APP_DOMAIN_RE.match(candidate):
-            out.append(candidate)
+            reason = _mcp_app_host_refusal(candidate, allow_local)
+            if reason:
+                logger.info("MCP App declared domain %r dropped: %s", candidate[:100], reason)
+            else:
+                out.append(candidate)
     return out
 
 
