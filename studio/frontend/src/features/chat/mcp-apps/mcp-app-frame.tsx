@@ -26,7 +26,22 @@ import {
   type McpUiResource,
   type McpUiToolCallResult,
 } from "../api/mcp-servers-api";
-import type { McpUiEnvelope } from "./mcp-ui";
+import {
+  RESIZE_FALLBACK,
+  bridgeShim,
+  cspFrameQuery,
+  newBridgeToken,
+  toolApprovalScope,
+  withBridgeShim,
+  type McpUiEnvelope,
+} from "./mcp-ui";
+import {
+  allowAttribute,
+  externalDomains,
+  grantablePermissions,
+  hostHoldsFeature,
+  sandboxOriginFor,
+} from "./permissions-csp";
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
 import { FullscreenChatBar } from "./fullscreen-chat-bar";
 import { registerLiveMcpApp } from "./live-apps";
@@ -34,7 +49,6 @@ import { parsePartialToolArgs } from "./streaming-args";
 import { setMcpAppModelContext } from "./model-context";
 import {
   MCP_APP_TOOL_DECLINED,
-  mcpAppApprovalScope,
   mcpAppArgsPreview,
   mcpAppToolKey,
 } from "./tool-approval";
@@ -118,210 +132,6 @@ function isJsonRpc(data: unknown): data is JsonRpcMessage {
     data !== null &&
     (data as { jsonrpc?: unknown }).jsonrpc === "2.0"
   );
-}
-
-// Height fallback for views that never send ui/notifications/size-changed; a
-// reported size always wins over it.
-const RESIZE_FALLBACK = `<script>(()=>{const post=()=>parent.postMessage({mcpAppHeight:document.documentElement.scrollHeight},"*");new ResizeObserver(post).observe(document.documentElement);window.addEventListener("load",post);post();})();</script>`;
-
-export function bridgeShim(token: string): string {
-  const hostOrigin = typeof window === "undefined" ? "" : window.location.origin;
-  // The view's handle on the host is a MessageChannel port, not the frame's
-  // parent window, and everything follows from that:
-  //
-  //   - it is bound to THIS document, so a page the frame navigates to can
-  //     neither send over it nor receive an in-flight reply on it;
-  //   - it IS `window.parent` here, so a view that filters responses on
-  //     `event.source === window.parent` -- the defensive habit, and what a
-  //     postMessage transport does by default -- still matches;
-  //   - `event.source.postMessage(...)` reaches the host for the same reason.
-  //
-  // A Window takes (message, targetOrigin, transfer) and a port takes
-  // (message, transfer), so the port's own postMessage is widened to accept the
-  // call a view actually writes.
-  //
-  // Behind the sandbox proxy the port reaches the proxy, which relays it to the
-  // host over a port of its own; in the opaque fallback it reaches the host.
-  return `(() => {
-  try {
-    const real = window.parent;
-    const channel = new MessageChannel();
-    const port = channel.port1;
-    const raw = port.postMessage.bind(port);
-    Object.defineProperty(port, "postMessage", {
-      value: (message, a, b) =>
-        raw(message, Array.isArray(a) ? a : Array.isArray(b) ? b : []),
-      configurable: true,
-      writable: true,
-    });
-    port.onmessage = (event) => {
-      window.dispatchEvent(new MessageEvent("message", {
-        data: event.data, source: port, origin: ${JSON.stringify(hostOrigin)},
-      }));
-    };
-    for (const name of ["parent", "top"]) {
-      try {
-        Object.defineProperty(window, name, { value: port, configurable: true });
-      } catch (e) {}
-    }
-    real.postMessage(
-      { __unslothMcpApp: ${JSON.stringify(token)}, __unslothMcpAppPort: true },
-      "*",
-      [channel.port2],
-    );
-  } catch (e) {}
-})();`;
-}
-
-/** A fresh bridge token, or null when nothing here can make an unguessable one.
- *
- * crypto.randomUUID needs a secure context and Studio is reachable over plain
- * HTTP on a LAN address (`-H 0.0.0.0`), where it is simply undefined. The other
- * chat call sites fall back to Date.now()+Math.random(), which is fine for an
- * attachment id and not for this: the token is what stops a page the frame
- * navigated to from installing a port of its own. getRandomValues is the right
- * fallback -- unlike randomUUID it is not secure-context gated.
- */
-export function newBridgeToken(): string | null {
-  const webCrypto = globalThis.crypto;
-  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
-  if (typeof webCrypto?.getRandomValues === "function") {
-    return Array.from(webCrypto.getRandomValues(new Uint8Array(16)), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
-  }
-  // A guessable token is worse than none, so the caller shows the failure.
-  return null;
-}
-
-/** Put `shim` where it runs before any of the view's own script.
- *
- * Parsed, not pattern-matched: the first textual `<head>` in a template can sit
- * inside a comment or a script string (`<!-- template has no <head> -->`), and a
- * shim inserted there never runs, which reads downstream as a view that simply
- * never initializes. A parse finds the element the browser will find.
- */
-export function withBridgeShim(html: string, shim: string): string {
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  const script = doc.createElement("script");
-  script.textContent = shim;
-  const parent = doc.head ?? doc.documentElement;
-  parent.insertBefore(script, parent.firstChild);
-  // Rebuilt rather than round-tripped through outerHTML alone: a template with no
-  // doctype is asking for quirks mode, and adding one would change how it lays out.
-  const doctype = doc.doctype ? `<!DOCTYPE ${doc.doctype.name}>\n` : "";
-  return doctype + doc.documentElement.outerHTML;
-}
-
-/** The outside hosts a template declared it will reach, for the user to see: the
- *  spec has the host warn when a UI requires external domain access. The local
- *  schemes (blob:, data:) reach nothing outside. */
-export function externalDomains(
-  csp: McpUiResource["ui"]["csp"] | undefined,
-): string[] {
-  if (!csp) return [];
-  const all = [
-    ...(csp.connectDomains ?? []),
-    ...(csp.resourceDomains ?? []),
-    ...(csp.frameDomains ?? []),
-    ...(csp.baseUriDomains ?? []),
-  ];
-  const hosts = new Set<string>();
-  for (const value of all) {
-    if (typeof value !== "string") continue;
-    const trimmed = value.trim();
-    if (!trimmed || ["blob:", "data:"].includes(trimmed.toLowerCase())) continue;
-    hosts.add(trimmed.replace(/^[a-z]+:\/\//i, ""));
-  }
-  return [...hosts];
-}
-
-/** Comma-joined declared domains for one CSP directive, or "" when undeclared. */
-function domainParam(values: string[] | undefined): string {
-  return Array.isArray(values) ? values.filter(Boolean).join(",") : "";
-}
-
-type Permissions = NonNullable<McpUiResource["ui"]["permissions"]>;
-
-/** The Permission Policy `allow` value for what a template asked for: the SDK's
- *  buildAllowAttribute mapping. */
-export function allowAttribute(permissions: Permissions | undefined): string {
-  if (!permissions || typeof permissions !== "object") return "";
-  return [
-    ["camera", "camera"],
-    ["microphone", "microphone"],
-    ["geolocation", "geolocation"],
-    ["clipboardWrite", "clipboard-write"],
-  ]
-    .filter(([key]) => Boolean(permissions[key as keyof Permissions]))
-    .map(([, feature]) => feature)
-    .join("; ");
-}
-
-const PERMISSION_FEATURES: [keyof Permissions, string][] = [
-  ["camera", "camera"],
-  ["microphone", "microphone"],
-  ["geolocation", "geolocation"],
-  ["clipboardWrite", "clipboard-write"],
-];
-
-/** Whether this page holds a Permission Policy feature it could delegate. Studio's
- *  own header turns camera and geolocation off, and a grant the page does not hold
- *  would be advertised to the view and then refused by the browser. Browsers with
- *  no policy API are given the benefit of the doubt; the browser decides anyway. */
-function hostHoldsFeature(feature: string): boolean {
-  const policy = (
-    document as Document & {
-      permissionsPolicy?: { allowsFeature?: (feature: string) => boolean };
-      featurePolicy?: { allowsFeature?: (feature: string) => boolean };
-    }
-  ).permissionsPolicy ?? (document as Document & {
-    featurePolicy?: { allowsFeature?: (feature: string) => boolean };
-  }).featurePolicy;
-  if (!policy || typeof policy.allowsFeature !== "function") return true;
-  try {
-    return policy.allowsFeature(feature);
-  } catch {
-    return false;
-  }
-}
-
-/** The requested permissions this host can actually pass on. */
-export function grantablePermissions(
-  requested: Permissions | undefined,
-  holds: (feature: string) => boolean,
-): Permissions {
-  const granted: Permissions = {};
-  if (!requested || typeof requested !== "object") return granted;
-  for (const [key, feature] of PERMISSION_FEATURES) {
-    if (requested[key] && holds(feature)) granted[key] = {};
-  }
-  return granted;
-}
-
-/** The sandbox proxy's origin: the backend's own host on the server's sandbox
- *  port, or null when the page could not load it: the listener speaks plain
- *  HTTP, which a secure page may frame only on loopback. */
-export function sandboxOriginFor(
-  port: number,
-  apiBase: string,
-  page: { protocol: string; origin: string },
-): string | null {
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
-  let backend: URL;
-  try {
-    backend = new URL(apiBase || page.origin);
-  } catch {
-    return null;
-  }
-  if (backend.protocol !== "http:") return null;
-  // Loopback is potentially trustworthy, so a secure page (the Windows desktop
-  // app's https://tauri.localhost) may still frame it; nothing else over HTTP.
-  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(backend.hostname);
-  if (page.protocol === "https:" && !loopback) return null;
-  const origin = `http://${backend.hostname}:${port}`;
-  // Different by construction (another port), but never hand the view the host's.
-  return origin === page.origin ? null : origin;
 }
 
 // Frames being torn down wait here for the view's answer, out of the layout and
@@ -496,7 +306,7 @@ export function McpAppFrame({
   const pendingCallsRef = useRef(pendingCalls);
   pendingCallsRef.current = pendingCalls;
   const allowToolAlways = useChatRuntimeStore((s) => s.allowToolAlways);
-  const approvalScope = mcpAppApprovalScope(sessionId, threadId);
+  const approvalScope = toolApprovalScope(sessionId, threadId);
 
   const { resourceUri } = ui;
 
@@ -562,18 +372,8 @@ export function McpAppFrame({
   // The CSP is fixed at request time, so declared domains ride the URL.
   const src = useMemo(() => {
     if (!resource || sandboxPort === undefined) return null;
-    const csp = resource.ui?.csp ?? {};
-    const query = new URLSearchParams();
+    const query = new URLSearchParams(cspFrameQuery(resource.ui?.csp));
     if (sandboxOrigin) query.set("host", window.location.origin);
-    const directives: [string, string][] = [
-      ["connect", domainParam(csp.connectDomains)],
-      ["resource", domainParam(csp.resourceDomains)],
-      ["frame", domainParam(csp.frameDomains)],
-      ["base_uri", domainParam(csp.baseUriDomains)],
-    ];
-    for (const [key, value] of directives) {
-      if (value) query.set(key, value);
-    }
     // Never put the auth token in the URL: in-frame code reads location.href.
     if (sandboxOrigin) return `${sandboxOrigin}/?${query.toString()}`;
     return apiUrl(
@@ -592,7 +392,7 @@ export function McpAppFrame({
       resource && bridgeToken
         ? withBridgeShim(
             `${resource.text}\n${RESIZE_FALLBACK}`,
-            bridgeShim(bridgeToken),
+            bridgeShim(bridgeToken, window.location.origin),
           )
         : null,
     [resource, bridgeToken],

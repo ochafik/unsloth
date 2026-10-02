@@ -11,6 +11,11 @@ import ts from "typescript";
 // No DOM renderer here and the frame pulls in React plus the runtime store, so
 // assert the wiring in the source, the way artifact-frame-network-access.test.ts does.
 const FRAME = "../src/features/chat/mcp-apps/mcp-app-frame.tsx";
+// The shim and the token minter are mcp-ui.ts's, which node loads as is.
+const SHIM_SOURCE = readFileSync(
+  fileURLToPath(new URL("../src/features/chat/mcp-apps/mcp-ui.ts", import.meta.url)),
+  "utf8",
+);
 
 const path = fileURLToPath(new URL(FRAME, import.meta.url));
 const text = readFileSync(path, "utf8");
@@ -43,11 +48,11 @@ function declarationText(name: string): string {
 
 /** A standalone `export function` from the frame, evaluated on its own. */
 function liftFunction<T>(signature: string): T {
-  const start = text.indexOf(signature);
-  assert.ok(start >= 0, `${signature} is no longer in mcp-app-frame.tsx`);
-  const end = text.indexOf("\n}\n", start);
+  const start = SHIM_SOURCE.indexOf(signature);
+  assert.ok(start >= 0, `${signature} is no longer in mcp-ui.ts`);
+  const end = SHIM_SOURCE.indexOf("\n}\n", start);
   assert.ok(end > start, `${signature} has no top-level closing brace`);
-  const declaration = text.slice(start, end + 3).replace(/^export /, "");
+  const declaration = SHIM_SOURCE.slice(start, end + 3).replace(/^export /, "");
   const name = /function (\w+)/.exec(declaration)?.[1];
   return new Function(
     `${
@@ -64,9 +69,9 @@ test("the view's handle on the host is its own port", () => {
   // load event -- both shown in tests/studio/playwright_mcp_app_bridge_smoke.py.
   // A port is the one handle that cannot outlive the document that made it, so it
   // is what the view gets, in place of window.parent.
-  const shimStart = text.indexOf("export function bridgeShim");
-  assert.ok(shimStart >= 0, "bridgeShim is no longer declared in mcp-app-frame.tsx");
-  const shim = text.slice(shimStart, text.indexOf("\n}\n", shimStart));
+  const shimStart = SHIM_SOURCE.indexOf("export function bridgeShim");
+  assert.ok(shimStart >= 0, "bridgeShim is no longer declared in mcp-ui.ts");
+  const shim = SHIM_SOURCE.slice(shimStart, SHIM_SOURCE.indexOf("\n}\n", shimStart));
   assert.ok(
     /Object\.defineProperty\(window, name, \{ value: port, configurable: true \}\)/.test(
       shim,
@@ -170,8 +175,8 @@ test("the frame is armed and listening inside the commit, not after it", () => {
 test("the bridge token survives a non-secure Studio origin", () => {
   // Studio is reachable over plain HTTP on a LAN address, where crypto.randomUUID
   // is simply undefined; calling it unconditionally threw on render and took every
-  // widget with it. getRandomValues is not secure-context gated, so it is the
-  // fallback -- not the Date.now()+Math.random() the attachment adapters use, which
+  // widget with it. getRandomValues is not secure-context gated, so it is what the
+  // minter uses -- not the Date.now()+Math.random() the attachment adapters use, which
   // is fine for an id and not for the value that names the seeded document.
   const mint = liftFunction<() => string | null>("export function newBridgeToken(");
   const realCrypto = globalThis.crypto;
@@ -191,10 +196,6 @@ test("the bridge token survives a non-secure Studio origin", () => {
       });
     }
   };
-
-  withCrypto({ randomUUID: () => "from-random-uuid" }, () => {
-    assert.equal(mint(), "from-random-uuid");
-  });
 
   withCrypto({ getRandomValues: realCrypto.getRandomValues.bind(realCrypto) }, () => {
     const first = mint();

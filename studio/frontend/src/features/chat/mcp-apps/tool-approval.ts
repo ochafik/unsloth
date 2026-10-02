@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// Both match what the chat adapter records, so "Always allow" given to the
-// model's call of a tool covers a widget's call of it in the same chat, and back.
-
-export function mcpAppApprovalScope(
-  sessionId: string | undefined,
-  threadId: string | undefined,
-): string {
-  const session = sessionId || "_default";
-  return threadId ? `${session}:${threadId}` : session;
-}
+// The scope is mcp-ui.ts's toolApprovalScope: what the chat adapter records, so "Always
+// allow" given to the model's call of a tool covers a widget's call of it in the same
+// chat, and back. The key below is the name the model's call of that tool carries.
 
 export function mcpAppToolKey(serverId: string, toolName: string): string {
   return `mcp__${serverId}__${toolName}`;

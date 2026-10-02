@@ -4,8 +4,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { toolApprovalScope as mcpAppApprovalScope } from "../src/features/chat/mcp-apps/mcp-ui.ts";
 import {
-  mcpAppApprovalScope,
   mcpAppArgsPreview,
   mcpAppToolKey,
 } from "../src/features/chat/mcp-apps/tool-approval.ts";
