@@ -37,9 +37,17 @@ test("the arguments shown with the question are bounded", () => {
 });
 
 test("a widget's tools/call is never sent as approved unless the user said so", () => {
-  const frame = read("features/chat/mcp-apps/mcp-app-frame.tsx");
-  const sends = [...frame.matchAll(/\bsend\(([^)]*)\)/g)].map((m) => m[1]);
+  const bridge = read("features/chat/mcp-apps/use-app-bridge.ts");
+  const sends = [...bridge.matchAll(/\bsend\(([^)]*)\)/g)].map((m) => m[1]);
   assert.deepEqual(sends.sort(), ["alwaysAllowed", "true"]);
-  // The one unconditional approval sits inside the user's own Allow.
-  assert.match(frame, /if \(allow\) \{\s*send\(true\)/);
+  // The one unconditional approval sits behind the user's own Allow.
+  assert.match(
+    bridge,
+    /if \(!\(await asked\)\) return declinedResult\(MCP_APP_TOOL_DECLINED\);\s*return toCallToolResult\(await send\(true\)\);/,
+  );
+  // And a frame nobody can see has no one to ask: it is refused, not queued.
+  assert.match(
+    bridge,
+    /if \(session\.parked\) return declinedResult\(NOT_ON_SCREEN\);\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*const asked = ctx\.prompts\.askTool/,
+  );
 });

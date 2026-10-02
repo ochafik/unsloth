@@ -11,6 +11,15 @@ import ts from "typescript";
 // No DOM renderer here and the frame pulls in React plus the runtime store, so
 // assert the wiring in the source, the way artifact-frame-network-access.test.ts does.
 const FRAME = "../src/features/chat/mcp-apps/mcp-app-frame.tsx";
+const mcpApps = (name: string) =>
+  readFileSync(
+    fileURLToPath(new URL(`../src/features/chat/mcp-apps/${name}`, import.meta.url)),
+    "utf8",
+  );
+const frameSource = mcpApps("use-frame-source.ts");
+const handshake = mcpApps("bridge-shim.ts");
+const transport = mcpApps("port-transport.ts");
+const bridgeSource = mcpApps("use-app-bridge.ts");
 // The shim and the token minter are mcp-ui.ts's, which node loads as is.
 const SHIM_SOURCE = readFileSync(
   fileURLToPath(new URL("../src/features/chat/mcp-apps/mcp-ui.ts", import.meta.url)),
@@ -28,7 +37,18 @@ const source = ts.createSourceFile(
 );
 
 /** The body of the `const <name> = ...` initializer, whatever it is wrapped in. */
-function declarationText(name: string): string {
+function declarationText(
+  name: string,
+  code = text,
+  file = "mcp-app-frame.tsx",
+): string {
+  const source = ts.createSourceFile(
+    file,
+    code,
+    ts.ScriptTarget.ESNext,
+    true,
+    ts.ScriptKind.TSX,
+  );
   let found: string | null = null;
   const visit = (node: ts.Node): void => {
     if (
@@ -42,7 +62,7 @@ function declarationText(name: string): string {
     node.forEachChild(visit);
   };
   source.forEachChild(visit);
-  assert.ok(found, `${name} is no longer declared in mcp-app-frame.tsx`);
+  assert.ok(found, `${name} is no longer declared in ${file}`);
   return found as unknown as string;
 }
 
@@ -93,11 +113,12 @@ test("the view's handle on the host is its own port", () => {
   // The handshake is the only thing left on the window, and it is what carries
   // the port, so it keeps the token check.
   assert.ok(
-    /envelope\.__unslothMcpApp !== bridgeToken/.test(text),
+    /envelope\.__unslothMcpApp !== bridgeToken/.test(handshake),
     "the handshake must still require the seeded document's token",
   );
   assert.ok(
-    /port\.onmessage = handler/.test(text),
+    /this\.port\.onmessage = /.test(transport) &&
+      /new PortTransport\(port,/.test(bridgeSource),
     "protocol traffic must be read off the port, not the window",
   );
 });
@@ -108,7 +129,7 @@ test("the view's handle on the host is its own port", () => {
 test("the token is minted per fetched template", () => {
   // A token reused across re-seeds would let a document that captured one earlier
   // keep talking after the frame moved on.
-  const token = declarationText("bridgeToken");
+  const token = declarationText("bridgeToken", frameSource, "use-frame-source.ts");
   assert.ok(
     /newBridgeToken\(\)/.test(token),
     "the bridge token must come from the minter, which handles a non-secure origin",
@@ -119,23 +140,39 @@ test("the token is minted per fetched template", () => {
   );
 });
 
-test("the view is seeded from the server's own blocks", () => {
+test("the view is seeded from the server's own blocks", async () => {
   // _flatten_result builds the model-facing transcript: an image-only result reads
   // "[1 image returned]" and a structuredContent-only one is
   // a Python repr of the payload. Neither is in the server's CallToolResult, so the
   // seed comes from the blocks the envelope carries, image bytes put back from the
   // image sentinel rather than duplicated on the seed line.
-  const seedView = declarationText("seedView");
+  const { toolResultParams } = await import("../src/features/chat/mcp-apps/mcp-ui.ts");
+  const params = toolResultParams(
+    {
+      resourceUri: "ui://x",
+      content: [
+        { type: "text", text: "hello" },
+        { type: "image", mimeType: "image/png" },
+        { type: "image", mimeType: "image/png", data: "inline" },
+        { type: "image", mimeType: "image/png" },
+      ],
+      structuredContent: { n: 1 },
+      _meta: { k: "v" },
+    },
+    [{ data: "AAAA", mimeType: "image/png" }],
+  ) as { content: { type: string; data?: string; text?: string }[] };
+  assert.deepEqual(
+    params.content.map((b) => b.data ?? b.text),
+    ["hello", "AAAA", "inline"],
+    "an image block arrives without data and is refilled in order; one the budget dropped is skipped",
+  );
+  assert.deepEqual(params, { ...params, structuredContent: { n: 1 }, _meta: { k: "v" } });
   assert.ok(
-    /for \(const block of ui\.content \?\? \[\]\)/.test(seedView),
-    "the seed must walk the server's blocks in order",
+    /toolResultParams\(ui, resultImages\)/.test(bridgeSource),
+    "the seed must come from the envelope's blocks",
   );
   assert.ok(
-    /block\.data === undefined/.test(seedView) && /images\.shift\(\)/.test(seedView),
-    "an image block arrives without data and must be refilled from the image sentinel",
-  );
-  assert.ok(
-    !/resultText/.test(text),
+    !/resultText/.test(text + bridgeSource),
     "the flattened body has no seeding role left",
   );
 });
@@ -148,7 +185,7 @@ test("the frame is armed and listening inside the commit, not after it", () => {
   // nothing ordering them, and losing once leaves the widget on the empty shell
   // permanently, with no second load to retry it.
   assert.ok(
-    /useLayoutEffect\(\(\) => \{\s*const holder = holderRef\.current;\s*if \(!src \|\| !html \|\| !holder\) return;\s*pendingPostRef\.current = true;/.test(
+    /useLayoutEffect\(\(\) => \{\s*const holder = holderRef\.current;\s*if \(!src \|\| !html \|\| !holder \|\| !bridgeToken\) return;\s*pendingPostRef\.current = true;/.test(
       text,
     ),
     "arming pendingPostRef must happen in the commit that makes the frame",
@@ -159,16 +196,19 @@ test("the frame is armed and listening inside the commit, not after it", () => {
     ),
     "the load listener must be on the frame before it can start loading",
   );
+  const listen = text.indexOf("const stopListening = listenForViewPort(");
   assert.ok(
-    /useLayoutEffect\(\(\) => \{\s*(?:\/\/[^\n]*\n\s*)*const handler = /.test(text),
-    "the message listener must be attached in the commit, before the view can post",
+    listen > text.indexOf("useLayoutEffect(() => {\n    const holder") &&
+      listen < text.indexOf("holder.appendChild(frame)"),
+    "the handshake listener must be attached in the commit, before the frame can post",
   );
-  // initializedRef used to be reset in its own passive effect, which could land
+  // `initialized` used to be a ref reset in its own passive effect, which could land
   // after the view had already said `initialized` and silently stop theme updates.
+  // It is now a field of the per-load session, which starts false and is never reset.
   assert.equal(
-    (text.match(/initializedRef\.current = false/g) ?? []).length,
+    (bridgeSource.match(/initialized: false/g) ?? []).length,
     1,
-    "initializedRef must be reset once, alongside the other per-load state",
+    "initialized must be per-session state, born false",
   );
 });
 
@@ -207,7 +247,7 @@ test("the bridge token survives a non-secure Studio origin", () => {
   // component renders the failure instead.
   withCrypto(undefined, () => assert.equal(mint(), null));
   assert.ok(
-    /resource && !bridgeToken/.test(text),
+    /resource && !bridgeToken/.test(frameSource),
     "a frame with no token must report the failure rather than render",
   );
 });

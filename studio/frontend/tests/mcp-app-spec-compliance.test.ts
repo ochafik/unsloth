@@ -2,16 +2,15 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 // What MCP Apps (2026-01-26) asks of a host, checked against the frame. The frame
-// pulls in React and the runtime store, so its pure helpers are lifted out of the
-// source and its wiring is asserted in the source, like mcp-app-frame-bridge.test.ts.
+// pulls in React and the runtime store, so its pure helpers are imported from the
+// leaf modules, its wiring is asserted in the source (like mcp-app-frame-bridge.test.ts),
+// and the SDK's AppBridge is run for real over the host's port transport.
 // The behaviour in a real browser is tests/studio/playwright_mcp_app_spec_e2e.py.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-
-import ts from "typescript";
 
 import {
   MAX_LIVE_WIDGETS,
@@ -32,46 +31,26 @@ import {
   type McpAppContextSnapshot,
 } from "../src/features/chat/mcp-apps/model-context.ts";
 
-const FRAME = fileURLToPath(
-  new URL("../src/features/chat/mcp-apps/mcp-app-frame.tsx", import.meta.url),
-);
-const text = readFileSync(FRAME, "utf8");
-const permissionsCsp = readFileSync(
-  new URL("../src/features/chat/mcp-apps/permissions-csp.ts", import.meta.url),
-  "utf8",
-);
+const mcpApps = (name: string) =>
+  readFileSync(
+    fileURLToPath(new URL(`../src/features/chat/mcp-apps/${name}`, import.meta.url)),
+    "utf8",
+  );
+const text = mcpApps("mcp-app-frame.tsx");
+const frameSource = mcpApps("use-frame-source.ts");
+const handshake = mcpApps("bridge-shim.ts");
+const bridgeSource = mcpApps("use-app-bridge.ts");
+const hostContextSource = mcpApps("use-host-context.ts");
+const lifecycle = mcpApps("frame-lifecycle.ts");
 const adapter = readFileSync(
   new URL("../src/features/chat/api/chat-adapter.ts", import.meta.url),
   "utf8",
 );
-
-function liftFunction<T>(signature: string, source = permissionsCsp): T {
-  const start = source.indexOf(signature);
-  assert.ok(start >= 0, `${signature} is no longer in the module that declared it`);
-  const end = source.indexOf("\n}\n", start);
-  const declaration = source.slice(start, end + 3).replace(/^export /, "");
-  const name = /function (\w+)/.exec(declaration)?.[1];
-  return new Function(
-    `${
-      ts.transpileModule(declaration, {
-        compilerOptions: { target: ts.ScriptTarget.ES2020 },
-      }).outputText
-    }; return ${name};`,
-  )() as T;
-}
-
-/** The body of one `case "<method>":` in the view's message handler. */
-function caseBody(method: string): string {
-  const start = text.indexOf(`case "${method}": {`);
-  assert.ok(start >= 0, `the handler no longer answers ${method}`);
-  const end = text.indexOf("\n        case ", start + 1);
-  return text.slice(start, end > start ? end : undefined);
-}
+const { allowAttribute, externalDomains, grantablePermissions, sandboxOriginFor } =
+  await import("../src/features/chat/mcp-apps/permissions-csp.ts");
 
 test("the sandbox proxy is served from another origin of the backend's own host", () => {
-  const origin = liftFunction<
-    (port: number, apiBase: string, page: { protocol: string; origin: string }) => string | null
-  >("export function sandboxOriginFor(");
+  const origin = sandboxOriginFor;
   const web = { protocol: "http:", origin: "http://127.0.0.1:8888" };
   assert.equal(origin(9001, "", web), "http://127.0.0.1:9001");
   // A LAN visitor reaches it on the address it already reaches Studio on.
@@ -104,7 +83,7 @@ test("the sandbox proxy is served from another origin of the backend's own host"
 });
 
 test("requested permissions become the SDK's allow attribute", () => {
-  const allow = liftFunction<(p: unknown) => string>("export function allowAttribute(");
+  const allow = allowAttribute as (p: unknown) => string;
   assert.equal(allow(undefined), "");
   assert.equal(allow({}), "");
   assert.equal(
@@ -118,13 +97,10 @@ test("requested permissions become the SDK's allow attribute", () => {
 test("only what the page itself holds is passed on, and only behind the proxy", () => {
   // Studio's own Permissions-Policy header turns camera and geolocation off: a
   // grant the page does not hold would be advertised and then refused.
-  const start = permissionsCsp.indexOf("const PERMISSION_FEATURES");
-  const end = permissionsCsp.indexOf("\n}\n", permissionsCsp.indexOf("export function grantablePermissions("));
-  const grantable = new Function(
-    `${ts.transpileModule(permissionsCsp.slice(start, end + 3).replace(/export /g, ""), {
-      compilerOptions: { target: ts.ScriptTarget.ES2020 },
-    }).outputText}; return grantablePermissions;`,
-  )() as (requested: unknown, holds: (f: string) => boolean) => Record<string, object>;
+  const grantable = grantablePermissions as (
+    requested: unknown,
+    holds: (f: string) => boolean,
+  ) => Record<string, object>;
   const studioHeader = (feature: string) => !["camera", "geolocation"].includes(feature);
   assert.deepEqual(
     grantable({ camera: {}, microphone: {}, geolocation: {}, clipboardWrite: {} }, studioHeader),
@@ -133,7 +109,7 @@ test("only what the page itself holds is passed on, and only behind the proxy", 
   assert.deepEqual(grantable(undefined, () => true), {});
   assert.deepEqual(grantable({ bogus: {} }, () => true), {});
   assert.match(
-    text,
+    frameSource,
     /sandboxOrigin\s*\?\s*grantablePermissions\(resource\?\.ui\?\.permissions, hostHoldsFeature\)\s*:\s*\{\}/,
   );
 });
@@ -146,90 +122,194 @@ test("the frame hands the view to the proxy the way the spec lays out", () => {
   );
   // The host waits for sandbox-proxy-ready from ITS frame, on the proxy's origin,
   // once per load, and only then sends sandbox-resource-ready.
-  assert.match(text, /if \(event\.origin !== sandboxOrigin\) return;/);
-  assert.match(text, /!== SANDBOX_PROXY_READY\)/);
-  assert.match(text, /if \(!pendingPostRef\.current\) return;\s*pendingPostRef\.current = false;/);
+  assert.match(handshake, /if \(event\.origin !== sandboxOrigin\) return;/);
+  assert.match(handshake, /!==\s*SANDBOX_PROXY_READY_METHOD,?\s*\)/);
+  assert.match(
+    handshake,
+    /if \(!pendingPostRef\.current\) return;[\s\S]*?pendingPostRef\.current = false;\s*const channel = new MessageChannel\(\);/,
+  );
   // ... addressed to the proxy's origin, never "*", with the host's port attached.
   assert.match(
-    text,
-    /method: SANDBOX_RESOURCE_READY,[\s\S]*?\},\s*sandboxOrigin,\s*\[channel\.port2\],/,
+    handshake,
+    /method: SANDBOX_RESOURCE_READY_METHOD,[\s\S]*?\},\s*sandboxOrigin,\s*\[channel\.port2\],/,
   );
   // A proxy that never answers is not a dead widget: the opaque shell takes over.
-  assert.match(text, /setProxyFailed\(true\)/);
+  assert.match(text, /source\.markProxyFailed\(\)/);
+  assert.match(frameSource, /setProxyFailed\(true\)/);
 });
 
-test("the host answers what a view may ask, and nothing reaches it early", () => {
-  assert.match(caseBody("ping"), /respond\(id, \{\}\)/);
-  // Negotiated, not a constant: a supported request is echoed.
-  assert.match(
-    caseBody("ui/initialize"),
-    /SUPPORTED_PROTOCOL_VERSIONS\.includes\(requested\)\s*\?\s*requested\s*:\s*UI_PROTOCOL_VERSION/,
+test("the host answers what a view may ask, and nothing reaches it early", async () => {
+  // The protocol is the SDK's AppBridge: it is constructed over the view's port, and
+  // what it advertises is only what this host implements.
+  assert.match(bridgeSource, /new AppBridge\(\s*null,\s*\{ name: HOST_NAME, version: HOST_VERSION \}/);
+  const caps = bridgeSource.slice(
+    bridgeSource.indexOf("function hostCapabilities("),
+    bridgeSource.indexOf("function toCallToolResult("),
   );
-  // Only what is implemented is advertised.
-  const init = caseBody("ui/initialize");
-  for (const capability of ["openLinks", "serverTools", "logging", "message"]) {
-    assert.match(init, new RegExp(`${capability}: `), `${capability} is implemented`);
+  for (const capability of ["openLinks", "serverTools", "serverResources", "logging", "message"]) {
+    assert.match(caps, new RegExp(`${capability}: `), `${capability} is implemented`);
   }
-  assert.match(init, /toolCallId\s*\?\s*\{\s*updateModelContext:/);
+  assert.match(caps, /ctx\.toolCallId\s*\?\s*\{\s*updateModelContext:/);
+  // The version is the package's, not a hand-stamped constant.
+  assert.match(bridgeSource, /HOST_VERSION: string = hostPackage\.version/);
   // Display modes: never one the host lacks or the View did not declare (when it
   // declared any), and the resulting mode is always returned.
-  const display = caseBody("ui/request-display-mode");
-  assert.match(display, /\(HOST_DISPLAY_MODES as readonly string\[\]\)\.includes\(requested\)/);
-  assert.match(display, /appModes === null \|\| appModes\.includes\(requested\)/);
-  assert.match(display, /: displayModeRef\.current;/);
-  assert.match(display, /respond\(id, \{ mode \}\)/);
-  assert.match(text, /const HOST_DISPLAY_MODES: readonly DisplayMode\[\] = \["inline", "fullscreen"\];/);
+  assert.match(bridgeSource, /\(HOST_DISPLAY_MODES as readonly string\[\]\)\.includes\(requested\)/);
+  assert.match(bridgeSource, /appModes === null \|\| appModes\.includes\(requested\)/);
+  assert.match(bridgeSource, /: ctx\.displayMode\(\);/);
+  assert.match(bridgeSource, /return \{ mode \};/);
+  assert.match(
+    hostContextSource,
+    /HOST_DISPLAY_MODES: readonly DisplayMode\[\] = \[\s*"inline",\s*"fullscreen",?\s*\];/,
+  );
   // Fullscreen lifts the container into the top layer in place, never moving the
   // frame (which would reload it), and every change reaches the View as context.
-  assert.match(text, /holder\.setAttribute\("popover", "manual"\);\s*holder\.showPopover\(\);/);
-  // Mode changes carry the display mode, dimensions, and the overlay's
-  // footprint as insets (the floating chat, the host bar).
   assert.match(
-    text,
-    /params: \{\s*displayMode,\s*containerDimensions: dimensions,\s*safeAreaInsets: insetsNow\(\),\s*\}/,
+    hostContextSource,
+    /holder\.setAttribute\("popover", "manual"\);\s*holder\.showPopover\(\);/,
   );
-  assert.match(text, /bottom: Math\.round\(overlayRef\.current\?\.getBoundingClientRect\(\)\.height \?\? 0\) \+ 16/);
-  // Measured when asked, not held in state: a mode change cannot report a stale
-  // footprint, and the overlay's growth is told on its own.
-  assert.match(text, /const insetsNow = useCallback/);
-  assert.match(text, /params: \{ safeAreaInsets: insetsNow\(\) \}/);
-  // Host-context updates wait for `initialized`.
+  // The context carries the display mode, dimensions, and the overlay's footprint as
+  // insets (the floating chat, the host bar), measured when asked, not held in state.
   assert.match(
-    text,
-    /if \(!initializedRef\.current\) return;\s*postToView\(\{\s*jsonrpc: "2\.0",\s*method: "ui\/notifications\/host-context-changed",/,
+    hostContextSource,
+    /displayMode: displayModeRef\.current,[\s\S]*?containerDimensions:\s*containerDimensions\(\)[\s\S]*?safeAreaInsets: insetsNow\(\),/,
   );
+  assert.match(hostContextSource, /bottom:\s*Math\.round\(overlayRef\.current\?\.getBoundingClientRect\(\)\.height \?\? 0\) \+\s*16/);
+  assert.match(hostContextSource, /const insetsNow = useCallback/);
+  // ... and the overlay's growth is told on its own.
+  assert.match(hostContextSource, /observer\.observe\(overlay\)/);
+  // Host-context updates wait for `initialized`, in the hook and at the bridge.
+  assert.match(hostContextSource, /if \(!ready\) return;\s*const request = requestAnimationFrame\(\(\) => push\(hostContext\(\)\)\);/);
+  assert.match(bridgeSource, /if \(!session\?\.initialized \|\| session\.parked\) return;\s*void Promise\.resolve\(session\.bridge\.setHostContext\(hostContext\)\)/);
   // A log notification carries `data`, per MCP logging.
-  assert.match(caseBody("notifications/message"), /\?\.data \?\?/);
+  assert.match(bridgeSource, /onloggingmessage = \(\{ level, data \}\)/);
+
+  // What AppBridge does with the port transport, run for real: negotiation echoes a
+  // supported version and answers any other with the newest; ping is answered;
+  // an unknown request is refused rather than left hanging; nothing is sent before
+  // `initialized` (the host only speaks when the bridge is asked to).
+  const { AppBridge, SUPPORTED_PROTOCOL_VERSIONS } = await import(
+    "@modelcontextprotocol/ext-apps/app-bridge"
+  );
+  const { PortTransport } = await import("../src/features/chat/mcp-apps/port-transport.ts");
+  const channel = new MessageChannel();
+  const heights: number[] = [];
+  const bridge = new AppBridge(null, { name: "Unsloth", version: "0.0.0" }, { openLinks: {} }, {
+    hostContext: { theme: "dark" },
+  });
+  let initialized = 0;
+  bridge.oninitialized = () => void (initialized += 1);
+  await bridge.connect(
+    new PortTransport(channel.port1, (data) => {
+      const h = (data as { mcpAppHeight?: unknown } | null)?.mcpAppHeight;
+      if (typeof h !== "number") return false;
+      heights.push(h);
+      return true;
+    }),
+  );
+  const view = channel.port2;
+  const inbox: Record<string, any>[] = [];
+  const waiters: (() => void)[] = [];
+  view.onmessage = (e) => {
+    inbox.push(e.data);
+    waiters.splice(0).forEach((w) => w());
+  };
+  const next = async (match: (m: Record<string, any>) => boolean) => {
+    for (;;) {
+      const found = inbox.find(match);
+      if (found) return found;
+      await new Promise<void>((r) => waiters.push(r));
+    }
+  };
+  const ask = async (id: number, method: string, params: unknown) => {
+    view.postMessage({ jsonrpc: "2.0", id, method, params });
+    return next((m) => m.id === id);
+  };
+  const newest = SUPPORTED_PROTOCOL_VERSIONS[0];
+  const init = await ask(1, "ui/initialize", {
+    protocolVersion: newest,
+    appInfo: { name: "view", version: "1" },
+    appCapabilities: {},
+  });
+  assert.equal(init.result.protocolVersion, newest);
+  assert.deepEqual(init.result.hostCapabilities, { openLinks: {} });
+  assert.deepEqual(init.result.hostContext, { theme: "dark" });
+  assert.equal(init.result.hostInfo.name, "Unsloth");
+  const odd = await ask(2, "ui/initialize", {
+    protocolVersion: "1999-01-01",
+    appInfo: { name: "view", version: "1" },
+    appCapabilities: {},
+  });
+  assert.equal(odd.result.protocolVersion, newest);
+  assert.deepEqual((await ask(3, "ping", {})).result, {});
+  assert.equal((await ask(4, "no/such-method", {})).error.code, -32601);
+  // The height fallback is not the protocol: it never reaches the bridge.
+  view.postMessage({ mcpAppHeight: 321 });
+  view.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+  await ask(5, "ping", {});
+  assert.deepEqual(heights, [321]);
+  assert.equal(initialized, 1);
+  assert.equal(inbox.filter((m) => m.method).length, 0, "the host sent nothing unasked");
+  await bridge.close();
+  view.close();
 });
 
 test("teardown is announced before the frame goes, and only to an initialized view", () => {
-  const request = text.slice(
-    text.indexOf("function requestTeardown("),
-    text.indexOf("function retireFrame("),
+  const request = lifecycle.slice(
+    lifecycle.indexOf("export async function requestTeardown("),
+    lifecycle.indexOf("/** Retire one loaded frame."),
   );
-  assert.match(request, /method: "ui\/resource-teardown",\s*params: \{ reason \}/);
-  // Answered on its id, or given up on after the grace -- never waited on forever.
-  assert.match(request, /data\.id === id && data\.method === undefined/);
-  assert.match(request, /const timer = setTimeout\(finish, timeoutMs\)/);
-  // Everything else the view says during its grace still reaches the bridge.
-  assert.match(request, /forward\?\.call\(port, event\)/);
+  // The spec's ui/resource-teardown, through AppBridge, carrying the reason.
+  assert.match(request, /bridge\.teardownResource\(\{ reason \}, \{ timeout: timeoutMs \}\)/);
+  // Answered, or given up on after the grace -- never waited on forever.
+  assert.match(request, /catch \{/);
 
-  const retire = text.slice(
-    text.indexOf("function retireFrame("),
-    text.indexOf("export interface McpAppFrameProps"),
-  );
+  const retire = lifecycle.slice(lifecycle.indexOf("export function retireFrame("));
   // The re-key retirement parks silently and serves on: sending teardown here
   // was destroying viewers mid-load ("no poll within 8s"). The announcement is
   // requestTeardown's, sent from the navigation blocker while the stream is
   // held (live-apps.ts), never from the retire path.
-  assert.match(retire, /function retireFrame\(frame: HTMLIFrameElement, port: MessagePort \| null\): void \{/);
-  assert.match(retire, /parkFrame\(frame\);/);
+  assert.match(retire, /session: ParkableSession \| null,\s*\): void \{/);
+  assert.match(retire, /parkFrame\(frame\)/);
   assert.doesNotMatch(retire, /requestTeardown/);
-  // Parked, not permanent: a frame whose successor never came is bounded.
+  // Where the frame cannot be parked, nothing keeps it: the bridge goes with it.
+  assert.match(retire, /if \(!parkFrame\(frame\)\) \{\s*session\.close\(\);\s*frame\.remove\(\);\s*return;\s*\}/);
+  // A parked frame has no one to ask; and it is bounded -- one whose successor
+  // never came does not serve forever.
+  assert.match(retire, /session\.park\(\);/);
   assert.match(retire, /PARKED_FRAME_LIFETIME_MS/);
   // Every path out -- a reload, the thread switching, the message being edited
   // -- still goes through the cleanup of the effect that made the frame.
-  assert.match(text, /retireFrame\(frame, port\);/);
+  assert.match(text, /retireFrame\(frame, detach\(\)\);/);
+});
+
+test("a parked frame's bridge refuses what needs the user, and leaves model context alone", () => {
+  assert.match(bridgeSource, /park\(\) \{\s*session\.parked = true;/);
+  // tools/call needing approval, ui/message, ui/open-link: refused, never queued.
+  assert.match(bridgeSource, /if \(session\.parked\) return declinedResult\(NOT_ON_SCREEN\);/);
+  assert.match(bridgeSource, /if \(session\.parked\) throw new ProtocolError\(DECLINED, NOT_ON_SCREEN\);\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*const asked = getContext\(\)\.prompts\.askMessage/);
+  assert.match(bridgeSource, /if \(session\.parked \|\| linkRequests\.length >= MAX_LINKS_PER_WINDOW\) \{\s*return \{ isError: true \};/);
+  const update = bridgeSource.slice(bridgeSource.indexOf("bridge.onupdatemodelcontext"));
+  assert.ok(
+    update.indexOf("if (session.parked) throw") < update.indexOf("setMcpAppModelContext("),
+    "a parked view must not update model context",
+  );
+});
+
+test("a widget's link is shown to the user and rate limited", () => {
+  const open = bridgeSource.slice(
+    bridgeSource.indexOf("bridge.onopenlink"),
+    bridgeSource.indexOf("bridge.onrequestdisplaymode"),
+  );
+  // http(s) only, then the rate limit, then the user's confirmation of the URL itself.
+  assert.match(open, /if \(!isHttpUrl\(url\)\) return \{ isError: true \};/);
+  assert.ok(open.indexOf("MAX_LINKS_PER_WINDOW") < open.indexOf("askLink(url)"));
+  assert.ok(open.indexOf("askLink(url)") < open.indexOf("openLink(url)"));
+  assert.match(open, /if \(!asked \|\| !\(await asked\)\) return \{ isError: true \};\s*openLink\(url\);/);
+  assert.equal((bridgeSource.match(/openLink\(/g) ?? []).length, 1);
+  const prompts = mcpApps("pending-prompts.tsx");
+  assert.match(prompts, /aria-label="Link from this app"/);
+  assert.match(prompts, /\{link\.text\}/);
 });
 
 test("leaving a conversation tells its widgets first, while they are mounted", () => {
@@ -250,23 +330,30 @@ test("leaving a conversation tells its widgets first, while they are mounted", (
   );
   // Leaving really leaves: the parked frames are cleared once the widgets
   // answered, so nothing of the old conversation keeps serving.
-  assert.match(text, /export function clearParkedMcpAppFrames\(\): void \{/);
+  assert.match(lifecycle, /export function clearParkedMcpAppFrames\(\): void \{/);
   // Every live widget registers under its conversation, and announces at most
   // once per load.
-  assert.match(text, /registerLiveMcpApp\(threadId, async \(reason, timeoutMs\) => \{/);
-  assert.match(text, /if \(!port \|\| !initializedRef\.current \|\| announcedRef\.current\) return;\s*announcedRef\.current = true;/);
+  assert.match(text, /registerLiveMcpApp\(\s*threadId,\s*async \(reason, timeoutMs\) => \{/);
+  assert.match(text, /if \(!session \|\| !session\.initialized \|\| announcedRef\.current\) return;\s*announcedRef\.current = true;/);
   // A view that was told and then stays is started over.
   assert.match(text, /setReloadNonce\(\(n\) => n \+ 1\)/);
 });
 
 test("a widget's message needs the user's say-so and becomes an ordinary user turn", () => {
-  const body = caseBody("ui/message");
-  assert.match(body, /setPendingMessage\(\{/);
-  assert.match(body, /fail\(id, DECLINED, "Message sending denied"\)/);
-  assert.match(body, /aui\.thread\(\)\.append\(\{\s*role: "user",/);
-  // Nothing is appended except inside the user's own Send.
-  assert.equal((text.match(/aui\.thread\(\)\.append\(/g) ?? []).length, 1);
-  assert.ok(body.indexOf("if (!sendIt)") < body.indexOf("aui.thread().append("));
+  const body = bridgeSource.slice(
+    bridgeSource.indexOf("bridge.onmessage"),
+    bridgeSource.indexOf("if (first.toolCallId)"),
+  );
+  assert.match(body, /prompts\.askMessage\(text\)/);
+  // Declined: an error the view's promise rejects with, not a sent message.
+  assert.match(body, /if \(!\(await asked\)\) \{\s*throw new ProtocolError\(DECLINED, "Message sending denied"\);/);
+  assert.match(text, /aui\.thread\(\)\.append\(\{\s*role: "user",/);
+  // Nothing is appended except on behalf of the user's own Send.
+  const sources = ["mcp-app-frame.tsx", "use-app-bridge.ts", "pending-prompts.tsx"].map(mcpApps);
+  assert.equal(sources.join("\n").match(/thread\(\)\.append\(/g)?.length, 1);
+  assert.ok(body.indexOf("if (!(await asked))") < body.indexOf("sendUserMessage(text)"));
+  // Only text is a chat turn; the role is the user's.
+  assert.match(body, /Only text messages can be sent/);
 });
 
 test("the live-widget registry tells only the widgets a navigation takes away", async () => {
@@ -297,7 +384,7 @@ test("the live-widget registry tells only the widgets a navigation takes away", 
 });
 
 test("the user is shown which outside hosts a widget can reach", () => {
-  const external = liftFunction<(csp: unknown) => string[]>("export function externalDomains(");
+  const external = externalDomains as (csp: unknown) => string[];
   assert.deepEqual(external(undefined), []);
   assert.deepEqual(
     external({
@@ -402,7 +489,7 @@ test("the adapter gives widget context to the model as a tool call and result, n
   assert.match(adapter, /threadId: resolvedThreadId,\s*toolCallIds: new Set\(/);
   // The tool result no longer carries it: history is append-only.
   assert.doesNotMatch(adapter, /mcpAppModelContextText|mcpAppModelContextImages/);
-  assert.match(caseBody("ui/update-model-context"), /setMcpAppModelContext\(toolCallId,/);
+  assert.match(bridgeSource, /setMcpAppModelContext\(ctx\.toolCallId,/);
 });
 
 test("a widget's state stays out of other conversations' prompts", async () => {
@@ -497,15 +584,14 @@ test("the widget mounts while the call streams, and is told partials and stops",
 
   // The frame: partials only while streaming and never after tool-input; the
   // seed waits for the result; the cancel notice is sent once.
+  assert.match(bridgeSource, /sendToolInputPartial\(\{ arguments: parsed \}\)/);
+  assert.match(bridgeSource, /if \(!ready \|\| !session \|\| phase !== "streaming" \|\| session\.seeded\) return;/);
+  assert.match(bridgeSource, /if \(!ready \|\| !session \|\| phase !== "settled" \|\| session\.seeded\) return;/);
+  // tool-input precedes tool-result.
+  assert.match(bridgeSource, /await bridge\.sendToolInput\(\{ arguments: toolArgs \?\? \{\} \}\);\s*await bridge\.sendToolResult\(/);
   assert.match(
-    text,
-    /method: "ui\/notifications\/tool-input-partial",\s*params: \{ arguments: parsed \}/,
-  );
-  assert.match(text, /if \(!viewReady \|\| phase !== "streaming" \|\| seededRef\.current\) return;/);
-  assert.match(text, /if \(!viewReady \|\| phase !== "settled" \|\| seededRef\.current\) return;/);
-  assert.match(
-    text,
-    /method: "ui\/notifications\/tool-cancelled",\s*params: \{ reason: "The user stopped this tool call\." \}/,
+    bridgeSource,
+    /sendToolCancelled\(\{ reason: "The user stopped this tool call\." \}\)/,
   );
 });
 
