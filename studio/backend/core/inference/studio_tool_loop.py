@@ -1495,6 +1495,7 @@ async def stream_with_studio_tools(
         conversation.extend(autoinject["messages"])
 
     round_id = 0
+    _round_no = 0
     executed_any = False
     model_name = run.model or "external"
     usage_totals: dict[str, Any] = {}
@@ -1545,6 +1546,7 @@ async def stream_with_studio_tools(
         # "stop" has gone out.
         held_final: str | None = None
 
+        _round_no += 1
         active_tools = controller.active_tools()
         tools_available = (
             tool_choice != "none" and bool(active_tools) and (unlimited or remaining > 0)

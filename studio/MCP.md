@@ -1,5 +1,50 @@
 # MCP in Unsloth Studio
 
+## MCP Apps: widgets in the chat
+
+An MCP server can ship a user interface with its tools: the tool declares a
+`ui://` template in its metadata, and instead of only printing text, Unsloth
+Studio renders the template as an interactive widget inline in the
+conversation. The published `@modelcontextprotocol/server-pdf` viewer is the
+reference example: ask for a paper and the PDF appears in the chat, with
+pagination, search and zoom that stay live while the conversation continues.
+
+Requirements: a tool-capable model, MCP enabled for the chat (the composer's
+MCP pill), and a server that declares UI resources. Studio announces the
+`io.modelcontextprotocol/ui` extension during the MCP handshake, so servers
+that gate their UI tools on host support register them for Studio.
+
+**Where the widget runs.** Each server's widgets are served from their own
+local origin — a second port on the same address Studio is reached on — and
+run sandboxed inside it. The widget cannot reach Studio's own storage or
+cookies, and one server's widgets cannot read another's. The caption under a
+widget names the outside hosts its template asked to reach; everything else is
+blocked by a default-deny content security policy built from the server's own
+declaration. Where no second origin is available (for example behind an HTTPS
+tunnel that cannot frame plain HTTP), the widget falls back to a stricter
+isolated mode and says so under the widget.
+
+**What the model sees and does.** The widget mounts while the model is still
+writing the tool's arguments and receives them as they stream in; when the
+result lands, the widget is seeded with it without reloading. A widget can
+report its state to the model (`ui/update-model-context`); the model reads the
+last report before each of your messages, images included on
+image-capable models. A widget can also ask to send a chat message as you —
+that always shows a Send / Don't send prompt first, and its own tool calls go
+through the chat's permission level (Allow / Deny / Always allow), exactly like
+the model's calls.
+
+**Leaving and returning.** Switching conversations tells each widget it is
+going and waits briefly for it to save its state (the spec's teardown
+notification); the per-server origin is remembered, so a widget's own storage
+survives restarts. The fullscreen button (or the widget's own, when it
+declares support) expands it to the window with a floating chat bar, and
+`Esc` or **Exit full screen** returns it inline.
+
+Widgets are untrusted content: they never see Studio credentials, their
+network reach is only what their server declared, and their results reach the
+model as tool output, subject to the same size bounds as any tool result.
+
 ## Connect Blender MCP
 
 Blender MCP is **disabled by default**. Unsloth Studio downloads a pinned, checksum-verified

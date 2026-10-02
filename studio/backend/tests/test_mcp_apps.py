@@ -258,16 +258,23 @@ def test_csp_defaults_to_deny_and_declared_domains_widen_only_their_directive():
     from routes.inference import _mcp_app_domains as parse
 
     assert build([], [], [], []) == (
-        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-        "img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; "
-        "frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; "
-        f"form-action 'none'; frame-ancestors {ancestors}; sandbox allow-scripts"
+        "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: data:; "
+        "style-src 'unsafe-inline' blob: data:; img-src blob: data:; font-src blob: data:; "
+        "media-src blob: data:; connect-src 'none'; frame-src 'none'; worker-src blob:; "
+        "object-src 'none'; base-uri 'none'; form-action 'none'; "
+        f"frame-ancestors {ancestors}; sandbox allow-scripts"
     )
     csp = build(parse("https://api.example.com"), parse("*.cdn.example.com"), [], [])
     assert "connect-src https://api.example.com;" in csp
-    assert "script-src 'unsafe-inline' *.cdn.example.com;" in csp
-    assert "img-src data: blob: *.cdn.example.com;" in csp
+    assert "script-src 'unsafe-inline' 'unsafe-eval' blob: data: *.cdn.example.com;" in csp
+    assert "img-src blob: data: *.cdn.example.com;" in csp
+    assert "worker-src blob: *.cdn.example.com;" in csp
+    # A resource domain must not become a connect domain: an image host is an exfiltration route.
+    assert "*.cdn.example.com" not in csp.split("connect-src ")[1].split(";")[0]
+    # blob:/data: are allowed undeclared (the reference host does; the PDF viewer needs a blob: Worker),
+    # and declaring them changes nothing.
     assert "worker-src blob:;" in build([], parse("blob:"), [], [])
+    assert "script-src 'unsafe-inline' 'unsafe-eval' blob: data:;" in build([], parse("blob:, data:"), [], [])
     assert "frame-src blob:;" in build([], [], parse("blob:"), [])
     assert parse("blob:, DATA:") == ["blob:", "data:"]
     assert parse("blob:", local_schemes = False) == []
@@ -542,3 +549,95 @@ def test_a_one_shot_widget_request_refuses_a_server_edited_meanwhile(monkeypatch
         mcp_client.read_resource_sync(
             "https://x/mcp", None, UI, timeout = 5, config_check = lambda: False
         )
+
+
+# --- MCP Apps capability negotiation (SEP-1724 extensions) -------------------
+
+
+def test_host_advertises_the_mcp_apps_extension_in_its_handshake():
+    """A server that gates UI tools on getUiCapability() must see the extension."""
+    from fastmcp import Client, FastMCP
+    from fastmcp.server.dependencies import get_context
+
+    from core.inference.mcp_client import (
+        MCP_APP_MIME_TYPE,
+        MCP_APPS_EXTENSION_ID,
+        _mcp_apps_client_class,
+    )
+
+    server = FastMCP("caps-probe")
+
+    @server.tool
+    def client_extensions() -> dict:
+        caps = get_context().session.client_params.capabilities
+        return caps.model_dump(by_alias = True, exclude_none = True).get("extensions") or {}
+
+    async def ask(client_cls):
+        async with client_cls(server) as client:
+            result = await client.call_tool("client_extensions", {})
+            return result.data or {}
+
+    advertised = asyncio.run(ask(_mcp_apps_client_class(Client)))
+    assert advertised == {MCP_APPS_EXTENSION_ID: {"mimeTypes": [MCP_APP_MIME_TYPE]}}
+    # The plain client leaves it out, so the assertion above measures the subclass.
+    assert MCP_APPS_EXTENSION_ID not in asyncio.run(ask(Client))
+
+
+def test_the_extension_keeps_any_extension_already_declared():
+    import mcp.types as mcp_types
+
+    from core.inference.mcp_client import MCP_APPS_EXTENSION_ID, _advertise_mcp_apps
+
+    sent = []
+
+    class Session:
+        async def send_request(self, request, *args, **kwargs):
+            sent.append(request)
+            return "ok"
+
+    session = Session()
+    _advertise_mcp_apps(session)
+    _advertise_mcp_apps(session)  # idempotent: one wrapper, not two
+    request = mcp_types.ClientRequest(
+        mcp_types.InitializeRequest(
+            params = mcp_types.InitializeRequestParams(
+                protocolVersion = mcp_types.LATEST_PROTOCOL_VERSION,
+                capabilities = mcp_types.ClientCapabilities.model_validate(
+                    {"extensions": {"example/other": {"on": True}}}
+                ),
+                clientInfo = mcp_types.Implementation(name = "t", version = "0"),
+            )
+        )
+    )
+    assert asyncio.run(session.send_request(request)) == "ok"
+    wire = sent[0].model_dump(by_alias = True, mode = "json", exclude_none = True)
+    extensions = wire["params"]["capabilities"]["extensions"]
+    assert extensions["example/other"] == {"on": True}
+    assert MCP_APPS_EXTENSION_ID in extensions
+    # Anything that is not the handshake passes through untouched.
+    ping = mcp_types.ClientRequest(mcp_types.PingRequest())
+    asyncio.run(session.send_request(ping))
+    assert sent[1] is ping
+
+
+def test_the_ui_tools_listing_names_only_tools_that_render(tmp_path, monkeypatch):
+    """The chat draws a widget while args stream; it needs name -> template."""
+    from routes import mcp_servers as routes_mcp
+
+    monkeypatch.setattr(routes_mcp, "_ui_server_or_404", lambda server_id, via_api_key: {"id": server_id})
+    from core.inference import tools as tools_mod
+
+    monkeypatch.setattr(
+        tools_mod,
+        "get_cached_tools",
+        lambda server_id: [
+            {"name": "plain"},
+            {"name": "show", "_meta": None},
+            {"name": "view", "meta": {"ui": {"resourceUri": "ui://s/t.html"}}},
+            {"name": "app_only", "_meta": {"ui": {"resourceUri": "ui://s/t.html", "visibility": ["app"]}}},
+        ],
+    )
+    res = asyncio.run(routes_mcp.mcp_ui_tools("s1", via_api_key = False))
+    # Both spellings of the metadata; visibility is the call gate's business, not
+    # the listing's: a widget may also be mounted for an app-only refresh.
+    assert res.tools == {"view": "ui://s/t.html", "app_only": "ui://s/t.html"}

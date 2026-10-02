@@ -19,11 +19,13 @@ import {
   mcpToolFromProvenance,
   splitMcpToolName,
 } from "@/features/chat/utils/mcp-tool-name";
-import { McpAppFrame } from "@/features/chat/mcp-apps/mcp-app-frame";
+import { McpAppFrame, type McpAppPhase } from "@/features/chat/mcp-apps/mcp-app-frame";
+import { getMcpUiTools } from "@/features/chat/api/mcp-servers-api";
 import {
   type McpUiToolResult,
   isMcpUiToolResult,
 } from "@/features/chat/mcp-apps/mcp-ui";
+import { parsePartialToolArgs } from "@/features/chat/mcp-apps/streaming-args";
 import { sandboxSessionIdFor } from "@/components/assistant-ui/sandbox-files";
 import { useChatProjectScope } from "@/features/chat/chat-project-scope";
 import { stripAnsi, stringifyToolResult } from "@/lib/strip-ansi";
@@ -42,11 +44,12 @@ import {
 import { Tick02Icon } from "@/lib/tick-icon";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
-  type CSSProperties,
-  type ComponentProps,
-  type ElementType,
   memo,
+  type ComponentProps,
+  type CSSProperties,
+  type ElementType,
   useCallback,
+  useEffect,
   useRef,
   useState,
 } from "react";
@@ -350,28 +353,102 @@ function isMcpImageResult(val: unknown): val is McpImageResult {
   );
 }
 
-/** Outside ToolFallbackContent so it stays on screen with the card collapsed. */
+/** Where the call stands, as the frame's phase. */
+function mcpAppPhase(
+  status: ToolCallMessagePartStatus | undefined,
+): McpAppPhase {
+  if (!status) return "settled";
+  if (status.type === "running") return "streaming";
+  if (status.type === "incomplete" && status.reason === "cancelled") {
+    return "cancelled";
+  }
+  // Failed without a result: nothing to draw.
+  return "settled";
+}
+
+/**
+ * The widget an MCP Apps tool result renders through. Outside
+ * `ToolFallbackContent` so it stays on screen with the card collapsed.
+ */
 function ToolFallbackMcpApp({
   toolName,
+  toolCallId,
   result,
   argsText,
+  status,
 }: {
   toolName: string;
-  result: McpUiToolResult;
+  toolCallId?: string;
+  result: unknown;
   argsText?: string;
+  status?: ToolCallMessagePartStatus;
 }) {
-  const threadId = useAuiState(({ threadListItem }) => threadListItem.remoteId);
+  const threadId = useAuiState(
+    ({ threadListItem }) => threadListItem.remoteId,
+  );
   // The provider's project (the store's lags a thread switch): the adapter keys the run's session on it.
   const projectId = useChatProjectScope();
   const parts = splitMcpToolName(toolName);
-  if (!parts) return null;
+  const serverId = parts?.serverId;
+  const settled = isMcpUiToolResult(result, toolName);
+  const phase = settled ? "settled" : mcpAppPhase(status);
+
+  // While the model is still writing the call, the template it will render is
+  // already known from the server, so the widget comes up and receives
+  // ui/notifications/tool-input-partial as the arguments parse.
+  const [templates, setTemplates] = useState<Record<string, string> | null>(
+    null,
+  );
+  useEffect(() => {
+    if (!serverId || settled) return;
+    let cancelled = false;
+    getMcpUiTools(serverId)
+      .then((tools) => {
+        if (!cancelled) setTemplates(tools);
+      })
+      .catch(() => {
+        if (!cancelled) setTemplates({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [serverId, settled]);
+
+  if (!serverId) return null;
+  // One frame across the whole life of the call: when the result arrives the
+  // props shift to settled and the frame is NOT reloaded -- the seed
+  // (tool-input, tool-result) goes down the port the view already holds.
+  const bare = parts?.tool ?? toolName;
+  const envelope = settled
+    ? result.ui
+    : phase === "settled" || !templates?.[bare]
+      ? null
+      : { resourceUri: templates[bare] };
+  if (!envelope) return null;
+
+  let toolArgs: Record<string, unknown> | undefined;
+  if (argsText) {
+    try {
+      const parsed: unknown = JSON.parse(argsText);
+      if (typeof parsed === "object" && parsed !== null) {
+        toolArgs = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Streaming leaves argsText partial; the frame sends what parses.
+      toolArgs = parsePartialToolArgs(argsText);
+    }
+  }
+
   return (
     <McpAppFrame
-      serverId={parts.serverId}
-      toolName={parts.tool}
-      ui={result.ui}
-      argsText={argsText}
-      resultImages={result.images}
+      serverId={serverId}
+      toolName={bare}
+      toolCallId={toolCallId}
+      ui={envelope}
+      phase={phase}
+      argsText={settled ? undefined : argsText}
+      toolArgs={toolArgs}
+      resultImages={settled ? result.images : undefined}
       threadId={threadId}
       sessionId={sandboxSessionIdFor(threadId, projectId)}
     />
@@ -472,6 +549,7 @@ function ToolFallbackError({
 
 const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   toolName,
+  toolCallId,
   argsText,
   result,
   status,
@@ -499,13 +577,15 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
         mcpTool={mcpToolFromProvenance(provenance)}
         status={status}
       />
-      {!isCancelled && widget && (
-        <ToolFallbackMcpApp
-          toolName={toolName}
-          result={widget}
-          argsText={argsText}
-        />
-      )}
+      {/* Rendered for a cancelled call too: the widget is told
+          ui/notifications/tool-cancelled, and teardown announces itself. */}
+      <ToolFallbackMcpApp
+        toolName={toolName}
+        toolCallId={toolCallId}
+        result={result}
+        argsText={argsText}
+        status={status}
+      />
       <ToolFallbackContent>
         <ToolFallbackError status={status} />
         <ToolFallbackArgs
