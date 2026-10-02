@@ -4,9 +4,14 @@
 import { attachedMediaUnavailableReason } from "../lib/attached-media-gate";
 import { externalModelLabel } from "../lib/external-model-label";
 import {
+  WIDGET_CONTEXT_TOOL_NAME,
+  type WidgetContextResult,
+  joinWidgetContextCalls,
   mcpAppContextNote,
   mcpAppContextSnapshot,
   prepareMcpAppContext,
+  widgetContextCallId,
+  widgetContextMessages,
 } from "../mcp-apps/model-context";
 import { registerMcpAppContextDb } from "../mcp-apps/model-context-db";
 import { mlxRuntimeStateFrom } from "../lib/mlx-runtime-state";
@@ -1200,8 +1205,12 @@ function toolCallPartSurvivesOpenAIReplay(part: ToolCallMessagePart): boolean {
 
 function studioToolHistoryRequestFieldsAfterReplay(
   messages: readonly ToolHistoryMessage[],
+  outbound: readonly SerializedMessage[],
 ): { studio_tool_history?: true } {
   return studioToolHistoryRequestFields(messages, {
+    hasSyntheticStudioCalls: outbound.some(
+      (message) => message.role === "tool" && message.name === WIDGET_CONTEXT_TOOL_NAME,
+    ),
     toolCallSurvives: (part) =>
       toolCallPartSurvivesOpenAIReplay(part as unknown as ToolCallMessagePart),
   });
@@ -1467,12 +1476,9 @@ function serializeAssistantReplayMessages(
 // Snapshots of MCP App state persist per message, so a reload replays the same history.
 registerMcpAppContextDb();
 
-/** What MCP App widgets reported when a user message was sent: a note that goes ahead
- *  of the user's own text, and the images it came with (see model-context.ts). */
-interface AppContextForMessage {
-  note: string;
-  images: Array<{ type: "image_url"; image_url: { url: string } }>;
-}
+/** What MCP App widgets reported when a user message was sent, as the synthetic tool
+ *  call that reads it (see model-context.ts). */
+type AppContextForMessage = WidgetContextResult;
 
 function toOpenAIMessages(
   message: RunMessage,
@@ -1495,29 +1501,25 @@ function toOpenAIMessages(
     );
   }
 
-  const ownText = collectTextParts(message).join("\n");
-  const textContent =
-    message.role === "user" && appContext?.note
-      ? `${appContext.note}\n\n${ownText}`
-      : ownText;
-  const imageParts =
-    message.role === "user" && appContext?.images.length
-      ? [...appContext.images, ...collectImageParts(message)]
-      : collectImageParts(message);
-  return [
-    {
-      role: message.role,
-      content: buildReplayContent(textContent, imageParts),
-    },
-  ];
+  const user = {
+    role: message.role,
+    content: buildReplayContent(
+      collectTextParts(message).join("\n"),
+      collectImageParts(message),
+    ),
+  } as SerializedMessage;
+  return message.role === "user" && appContext
+    ? [...widgetContextMessages<SerializedMessage>(appContext), user]
+    : [user];
 }
 
 /**
- * The MCP App context each user message carries. The note goes with every message
- * that has one, the same text every time. The images go only with the message being
- * answered, the newest, and only to a target that reads images: an earlier turn then
- * sheds them once, at the end of the history, and never changes again -- so the
- * prompt cache up to it holds, and a message sent with no new update adds nothing.
+ * The MCP App context each user message carries. The text goes with every message that
+ * has a snapshot, the same text every time. The images go only with the message being
+ * answered, the newest, and only to a target that reads images (as the MCP image
+ * envelope, which the backend promotes for every provider): an earlier turn then sheds
+ * them once, at the end of the history, and never changes again -- so the prompt cache
+ * up to it holds, and a message sent with no new update adds nothing.
  */
 function planAppContext(
   messages: RunMessages,
@@ -1534,19 +1536,21 @@ function planAppContext(
     if (message.role !== "user") return undefined;
     const snapshot = mcpAppContextSnapshot(message.id);
     if (!snapshot) return undefined;
-    const images: AppContextForMessage["images"] = [];
+    const images: McpImage[] = [];
     if (readsImages && message.id === newestUserId) {
       for (const entry of snapshot.entries) {
         for (const image of entry.images) {
           if (images.length >= MAX_MODEL_IMAGES) break;
-          images.push({
-            type: "image_url",
-            image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-          });
+          images.push({ data: image.data, mimeType: image.mimeType });
         }
       }
     }
-    return { note: mcpAppContextNote(snapshot), images };
+    return {
+      callId: widgetContextCallId(message.id),
+      result:
+        mcpAppContextNote(snapshot) +
+        (images.length > 0 ? mcpImagesEnvelope(images) : ""),
+    };
   };
 }
 
@@ -2010,8 +2014,11 @@ export async function buildLocalTokenCountHistory(
   const survivingMessages = pruneOutboundHistory(messages, true);
   // The token count reads what is already captured, text only; capturing happens on send.
   const appContextFor = planAppContext(survivingMessages, false);
-  const outboundMessages = survivingMessages
-    .flatMap((message) => toOpenAIMessages(message, true, appContextFor(message)))
+  const outboundMessages = joinWidgetContextCalls(
+    survivingMessages.flatMap((message) =>
+      toOpenAIMessages(message, true, appContextFor(message)),
+    ),
+  )
     .filter((message): message is NonNullable<typeof message> =>
       Boolean(message),
     );
@@ -2062,6 +2069,7 @@ export async function buildLocalTokenCountHistory(
     messages: outboundMessages as OpenAIChatMessage[],
     ...studioToolHistoryRequestFieldsAfterReplay(
       survivingMessages as unknown as ToolHistoryMessage[],
+      outboundMessages,
     ),
   };
 }
@@ -5092,14 +5100,25 @@ export function createOpenAIStreamAdapter(
       // replayed with each earlier one as it was captured (model-context.ts).
       await prepareMcpAppContext(
         messages.filter((message) => message.role === "user").map((message) => message.id),
+        {
+          threadId: resolvedThreadId,
+          toolCallIds: new Set(
+            messages.flatMap((message) =>
+              (message.content ?? []).flatMap((part) =>
+                part.type === "tool-call" ? [part.toolCallId] : [],
+              ),
+            ),
+          ),
+        },
       );
       const appContextFor = planAppContext(renderedMessages, targetReadsImages);
       // toOpenAIMessages emits assistant tool_calls plus role="tool" follow-ups; the backend Gemini
       // translator rebuilds the functionCall/functionResponse parts.
-      let outboundMessages = renderedMessages
-        .flatMap((message) =>
+      let outboundMessages = joinWidgetContextCalls(
+        renderedMessages.flatMap((message) =>
           toOpenAIMessages(message, replayReasoning, appContextFor(message)),
-        )
+        ),
+      )
         .filter((message): message is NonNullable<typeof message> =>
           Boolean(message),
         );
@@ -6629,6 +6648,7 @@ export function createOpenAIStreamAdapter(
             ...(continuation ? { continue_final_message: true } : {}),
             ...studioToolHistoryRequestFieldsAfterReplay(
               survivingMessages as unknown as ToolHistoryMessage[],
+              outboundMessages,
             ),
             // Opt into the trailing usage chunk so the context bar and tok/s populate (backend gates it).
             stream_options: { include_usage: true },

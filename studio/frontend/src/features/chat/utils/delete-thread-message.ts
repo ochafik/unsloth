@@ -13,6 +13,7 @@ import type {
   ThreadMessage,
 } from "@assistant-ui/react";
 import { listChatMessages } from "../api/chat-api";
+import { pruneMcpAppContextForMessages } from "../mcp-apps/model-context";
 import type { MessageRecord } from "../types";
 import {
   ensureStoredChatThread,
@@ -169,4 +170,5 @@ export async function deleteThreadMessage(args: {
     });
   }
   thread.import(next);
+  void pruneMcpAppContextForMessages([messageId, ...assistantReplyIds]);
 }

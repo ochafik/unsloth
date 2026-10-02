@@ -39,6 +39,7 @@ import {
   markChatThreadDeleted,
   markChatThreadsDeleted,
 } from "./chat-thread-tombstones";
+import { pruneMcpAppContextForThreads } from "../mcp-apps/model-context";
 import { ThreadRecordWriteCoordinator } from "./thread-record-write-coordinator";
 // eslint-disable-next-line no-restricted-imports -- this file is in the startup cycle; the chat barrel closes it.
 import { setForkBoundary } from "../stores/fork-boundary-store";
@@ -1256,6 +1257,8 @@ export async function deleteStoredChatThreads(
     failedThreadRecordByThreadId.delete(id);
     initializingThreadRecords.delete(id);
   }
+  // The widgets' captured model context goes with its conversation.
+  void pruneMcpAppContextForThreads(ids);
   threadRecordWrites.confirmFinalState(ids);
   if (ids.length === 0) return kept;
   await readLegacyStore(

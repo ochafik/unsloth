@@ -14,7 +14,16 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 import {
+  MAX_LIVE_WIDGETS,
+  WIDGET_CONTEXT_TOOL_NAME,
+  joinWidgetContextCalls,
+  widgetContextCallId,
+  widgetContextMessages,
+  MAX_MODEL_CONTEXT_CHARS,
+  MAX_SNAPSHOT_CHARS,
   mcpAppContextNote,
+  pruneMcpAppContextForMessages,
+  pruneMcpAppContextForThreads,
   mcpAppContextSnapshot,
   prepareMcpAppContext,
   resetMcpAppContextForTests,
@@ -358,6 +367,8 @@ test("snapshots replay unchanged after a reload, and still dedupe against it", a
   const store = {
     getMany: async (ids: readonly string[]) => ids.map((id) => saved.get(id)),
     put: async (snapshot: McpAppContextSnapshot) => void saved.set(snapshot.messageId, snapshot),
+    deleteForMessages: async () => {},
+    deleteForThreads: async () => {},
   };
   setMcpAppModelContext("pdf", page(7, true));
   setMcpAppContextStore(store);
@@ -370,16 +381,86 @@ test("snapshots replay unchanged after a reload, and still dedupe against it", a
   await prepareMcpAppContext(["u1", "u2"]);
   assert.equal(mcpAppContextNote(mcpAppContextSnapshot("u1")!), before, "same history after reload");
   assert.equal(mcpAppContextSnapshot("u2"), undefined, "unchanged state: nothing new");
-  assert.match(before, /^\[State of the viewer app in this conversation when this message was sent \(with an image\):\]\npage 7$/);
+  assert.match(before, /^Untrusted data reported by interactive widgets/);
+  assert.match(before, /\[State of the viewer app when the user sent their next message \(with an image\):\]\npage 7$/);
 });
 
-test("the adapter puts the note ahead of the user's text, and images only on the message answered", () => {
-  assert.match(adapter, /message\.role === "user" && appContext\?\.note\s*\?\s*`\$\{appContext\.note\}\\n\\n\$\{ownText\}`/);
+test("the adapter gives widget context to the model as a tool call and result, never as the user's words", () => {
+  // A synthetic read_widget_context call and its result sit ahead of the user's message.
+  assert.match(adapter, /\? \[\.\.\.widgetContextMessages<SerializedMessage>\(appContext\), user\]/);
+  // The user's own message is built from its own parts only.
+  assert.doesNotMatch(adapter, /appContext\??\.note/);
+  // Images ride the MCP image envelope, only on the message answered.
   assert.match(adapter, /if \(readsImages && message\.id === newestUserId\) \{/);
+  assert.match(adapter, /mcpImagesEnvelope\(images\)/);
   assert.match(adapter, /await prepareMcpAppContext\(/);
+  // The conversation's own widgets only.
+  assert.match(adapter, /threadId: resolvedThreadId,\s*toolCallIds: new Set\(/);
   // The tool result no longer carries it: history is append-only.
   assert.doesNotMatch(adapter, /mcpAppModelContextText|mcpAppModelContextImages/);
   assert.match(caseBody("ui/update-model-context"), /setMcpAppModelContext\(toolCallId,/);
+});
+
+test("a widget's state stays out of other conversations' prompts", async () => {
+  resetMcpAppContextForTests();
+  setMcpAppModelContext("call-a", { toolName: "map", content: [{ type: "text", text: "A's map" }] });
+  setMcpAppModelContext("call-b", { toolName: "map", content: [{ type: "text", text: "B's map" }] });
+  await prepareMcpAppContext(["u1"], { toolCallIds: new Set(["call-b"]) });
+  assert.deepEqual(mcpAppContextSnapshot("u1")?.entries.map((e) => e.text), ["B's map"]);
+  // With a thread id on both sides it is the thread that decides.
+  resetMcpAppContextForTests();
+  setMcpAppModelContext("c1", { toolName: "map", threadId: "t1", content: [{ type: "text", text: "one" }] });
+  setMcpAppModelContext("c2", { toolName: "map", threadId: "t2", content: [{ type: "text", text: "two" }] });
+  await prepareMcpAppContext(["u1"], { threadId: "t2" });
+  assert.deepEqual(mcpAppContextSnapshot("u1")?.entries.map((e) => e.text), ["two"]);
+  assert.equal(mcpAppContextSnapshot("u1")?.threadId, "t2");
+  // Nothing of the conversation's own: nothing captured.
+  resetMcpAppContextForTests();
+  setMcpAppModelContext("c1", { toolName: "map", content: [{ type: "text", text: "x" }] });
+  await prepareMcpAppContext(["u1"], { toolCallIds: new Set() });
+  assert.equal(mcpAppContextSnapshot("u1"), undefined);
+});
+
+test("content is bounded when stored, per widget, per message and in widgets kept", async () => {
+  resetMcpAppContextForTests();
+  const big = "x".repeat(MAX_MODEL_CONTEXT_CHARS * 3);
+  setMcpAppModelContext("w0", { toolName: "w", content: [{ type: "text", text: big }] });
+  setMcpAppModelContext("w1", { toolName: "w", content: [{ type: "text", text: big }] });
+  setMcpAppModelContext("w2", { toolName: "w", content: [{ type: "text", text: big }] });
+  await prepareMcpAppContext(["u1"]);
+  const entries = mcpAppContextSnapshot("u1")!.entries;
+  assert.ok(entries.every((e) => e.text.length <= MAX_MODEL_CONTEXT_CHARS + 20));
+  assert.ok(entries.reduce((n, e) => n + e.text.length, 0) <= MAX_SNAPSHOT_CHARS);
+  resetMcpAppContextForTests();
+  for (let i = 0; i < MAX_LIVE_WIDGETS + 10; i++) {
+    setMcpAppModelContext(`w${i}`, { toolName: "w", content: [{ type: "text", text: `s${i}` }] });
+  }
+  await prepareMcpAppContext(["u1"]);
+  assert.equal(mcpAppContextSnapshot("u1")!.entries.length, MAX_LIVE_WIDGETS);
+});
+
+test("snapshots are deleted with their thread or message, in memory and in the store", async () => {
+  resetMcpAppContextForTests();
+  const saved = new Map<string, McpAppContextSnapshot>();
+  setMcpAppContextStore({
+    getMany: async (ids: readonly string[]) => ids.map((id) => saved.get(id)),
+    put: async (snapshot: McpAppContextSnapshot) => void saved.set(snapshot.messageId, snapshot),
+    deleteForMessages: async (ids: readonly string[]) => ids.forEach((id) => saved.delete(id)),
+    deleteForThreads: async (ids: readonly string[]) => {
+      for (const [id, snap] of saved) if (snap.threadId && ids.includes(snap.threadId)) saved.delete(id);
+    },
+  });
+  setMcpAppModelContext("c1", { toolName: "w", threadId: "t1", content: [{ type: "text", text: "a" }] });
+  await prepareMcpAppContext(["u1"], { threadId: "t1" });
+  setMcpAppModelContext("c1", { toolName: "w", threadId: "t1", content: [{ type: "text", text: "b" }] });
+  await prepareMcpAppContext(["u1", "u2"], { threadId: "t1" });
+  assert.equal(saved.size, 2);
+  await pruneMcpAppContextForMessages(["u2"]);
+  assert.deepEqual([...saved.keys()], ["u1"]);
+  assert.equal(mcpAppContextSnapshot("u2"), undefined);
+  await pruneMcpAppContextForThreads(["t1"]);
+  assert.equal(saved.size, 0);
+  assert.equal(mcpAppContextSnapshot("u1"), undefined);
 });
 
 test("partial tool arguments parse as they stream, and stop mattering once whole", async () => {
@@ -427,4 +508,43 @@ test("the widget mounts while the call streams, and is told partials and stops",
 test("a fallback the user can see when no app origin is available", () => {
   assert.match(text, /stricter isolated mode/);
   assert.match(text, /!fullscreen && !loading && !sandboxOrigin/);
+});
+
+test("the widget-context pair is a tool call and result that join the reply before it", () => {
+  const context = { callId: widgetContextCallId("msg-1_ab/cd"), result: "Untrusted data...\npage 7" };
+  assert.equal(context.callId, "call_widgetctx_msg1abcd");
+  const pair = widgetContextMessages(context);
+  assert.deepEqual(
+    pair.map((m) => m.role),
+    ["assistant", "tool"],
+  );
+  assert.equal(pair[0].tool_calls?.[0].function.name, WIDGET_CONTEXT_TOOL_NAME);
+  assert.equal(pair[0].tool_calls?.[0].function.arguments, "{}");
+  assert.equal(pair[1].tool_call_id, context.callId);
+  const history = [
+    { role: "user" as const, content: "show it" },
+    { role: "assistant" as const, content: "Here it is." },
+    ...pair,
+    { role: "user" as const, content: "what page?" },
+  ];
+  const joined = joinWidgetContextCalls(history);
+  // No two assistant turns in a row: the call rides on the reply's own message.
+  assert.deepEqual(joined.map((m) => m.role), ["user", "assistant", "tool", "user"]);
+  assert.equal(joined[1].content, "Here it is.");
+  assert.equal(joined[1].tool_calls?.[0].id, context.callId);
+  // After a user turn it stands alone; a real tool call is never rewritten.
+  const first = joinWidgetContextCalls([{ role: "user" as const, content: "x" }, ...pair]);
+  assert.deepEqual(first.map((m) => m.role), ["user", "assistant", "tool"]);
+});
+
+test("the synthetic widget-context call counts as Studio's own tool history", async () => {
+  const { studioToolHistoryRequestFields } = await import(
+    "../src/features/chat/utils/studio-tool-history.ts"
+  );
+  assert.deepEqual(studioToolHistoryRequestFields([]), {});
+  assert.deepEqual(studioToolHistoryRequestFields([], { hasSyntheticStudioCalls: true }), {
+    studio_tool_history: true,
+  });
+  const foreign = [{ content: [{ type: "tool-call", provenance: { source: "hosted" } }] }];
+  assert.deepEqual(studioToolHistoryRequestFields(foreign, { hasSyntheticStudioCalls: true }), {});
 });
