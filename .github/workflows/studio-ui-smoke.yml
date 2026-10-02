@@ -46,6 +46,7 @@ on:
       # tests/conftest.py, the tests package and tests/_shared.
       - 'tests/studio/playwright_*.py'
       - 'tests/studio/_playwright_robust.py'
+      - 'tests/studio/_fake_openai_tool_model.py'
       - 'tests/studio/test_stt_model_search_locator_contract.py'
       - 'tests/conftest.py'
       - 'tests/__init__.py'
@@ -99,6 +100,7 @@ on:
       # tests/conftest.py, the tests package and tests/_shared.
       - 'tests/studio/playwright_*.py'
       - 'tests/studio/_playwright_robust.py'
+      - 'tests/studio/_fake_openai_tool_model.py'
       - 'tests/studio/test_stt_model_search_locator_contract.py'
       - 'tests/conftest.py'
       - 'tests/__init__.py'
@@ -641,6 +643,27 @@ jobs:
           export STUDIO_MCP_PYTHON="$studio_home/unsloth_studio/bin/python"
           test -x "$STUDIO_MCP_PYTHON"
           python tests/studio/playwright_mcp_arguments.py
+
+      # A real MCP Apps widget through the real Studio, against the spec. No model and no
+      # network beyond one `npm pack` of the published ext-apps SDK: the model is the
+      # scripted fake in tests/studio/_fake_openai_tool_model.py, the server is the stdio
+      # fixture in studio/backend/tests/fixtures, and the API the widget declares is a
+      # loopback listener the script starts.
+      - name: MCP Apps spec conformance end to end (Playwright)
+        if: matrix.shard == 'extra'
+        timeout-minutes: 10
+        env:
+          BASE_URL: http://127.0.0.1:18894
+          STUDIO_OLD_PW: ${{ env.STUDIO_EXTRA_OLD_PW }}
+          STUDIO_NEW_PW: ${{ env.STUDIO_EXTRA_NEW_PW }}
+          PW_ART_DIR: logs/playwright_mcp_app_spec
+          STUDIO_UI_STRICT: '1'
+        run: |
+          mkdir -p logs/playwright_mcp_app_spec
+          studio_home="${UNSLOTH_STUDIO_HOME:-$HOME/.unsloth/studio}"
+          export STUDIO_MCP_PYTHON="$studio_home/unsloth_studio/bin/python"
+          test -x "$STUDIO_MCP_PYTHON"
+          python tests/studio/playwright_mcp_app_spec_e2e.py
 
       - name: Per-chat settings persistence (Playwright)
         if: matrix.shard == 'extra'
