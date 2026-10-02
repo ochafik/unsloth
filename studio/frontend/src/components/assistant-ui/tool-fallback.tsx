@@ -19,7 +19,7 @@ import {
   mcpToolFromProvenance,
   splitMcpToolName,
 } from "@/features/chat/utils/mcp-tool-name";
-import { McpAppFrame, type McpAppPhase } from "@/features/chat/mcp-apps/mcp-app-frame";
+import type { McpAppPhase } from "@/features/chat/mcp-apps/mcp-app-frame";
 import { getMcpUiTools } from "@/features/chat/api/mcp-servers-api";
 import {
   type McpUiToolResult,
@@ -44,6 +44,8 @@ import {
 import { Tick02Icon } from "@/lib/tick-icon";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
+  Suspense,
+  lazy,
   memo,
   type ComponentProps,
   type CSSProperties,
@@ -63,6 +65,13 @@ import {
   syncToolActivityPreference,
   toolActivityOpen,
 } from "./tool-activity-open-state";
+
+// Loaded when a widget is first drawn: the MCP Apps SDK is no part of the first screen.
+const McpAppFrame = lazy(() =>
+  import("@/features/chat/mcp-apps/mcp-app-frame").then((m) => ({
+    default: m.McpAppFrame,
+  })),
+);
 
 const ANIMATION_DURATION = 200;
 
@@ -440,18 +449,24 @@ function ToolFallbackMcpApp({
   }
 
   return (
-    <McpAppFrame
-      serverId={serverId}
-      toolName={bare}
-      toolCallId={toolCallId}
-      ui={envelope}
-      phase={phase}
-      argsText={settled ? undefined : argsText}
-      toolArgs={toolArgs}
-      resultImages={settled ? result.images : undefined}
-      threadId={threadId}
-      sessionId={sandboxSessionIdFor(threadId, projectId)}
-    />
+    <Suspense
+      fallback={
+        <div className="mt-2 h-[120px] w-full animate-pulse rounded bg-muted/30" />
+      }
+    >
+      <McpAppFrame
+        serverId={serverId}
+        toolName={bare}
+        toolCallId={toolCallId}
+        ui={envelope}
+        phase={phase}
+        argsText={settled ? undefined : argsText}
+        toolArgs={toolArgs}
+        resultImages={settled ? result.images : undefined}
+        threadId={threadId}
+        sessionId={sandboxSessionIdFor(threadId, projectId)}
+      />
+    </Suspense>
   );
 }
 
