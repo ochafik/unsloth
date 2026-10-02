@@ -4338,6 +4338,33 @@ def _mcp_app_domains(
     return out
 
 
+_MCP_APP_CSP_FIELDS = ("connectDomains", "resourceDomains", "frameDomains", "baseUriDomains")
+
+
+def _mcp_app_blocked_domains(csp: Any, allow_local: bool) -> list:
+    """The declared domains `_mcp_app_domains` will drop for this server, so the caption
+    shown to the user matches the policy the frame is actually given."""
+    if not isinstance(csp, dict):
+        return []
+    blocked: list = []
+    for field in _MCP_APP_CSP_FIELDS:
+        declared = csp.get(field)
+        if not isinstance(declared, list):
+            continue
+        names = [d.strip() for d in declared if isinstance(d, str) and d.strip()]
+        kept = set(
+            _mcp_app_domains(
+                ",".join(names),
+                local_schemes = field != "baseUriDomains",
+                allow_local = allow_local,
+            )
+        )
+        for name in names:
+            if name not in kept and name.lower() not in kept and name not in blocked:
+                blocked.append(name)
+    return blocked
+
+
 def _mcp_app_csp(
     connect: list,
     resource: list,
@@ -4391,18 +4418,33 @@ async def mcp_app_frame(
     resource: Optional[str] = None,
     frame: Optional[str] = None,
     base_uri: Optional[str] = None,
+    server_id: Optional[str] = None,
 ):
     """Serve the opaque sandbox shell for an MCP App widget.
 
     Unauthenticated like the canvas shell it reuses: the URL is readable by the
     widget and this static document exposes no server resource. Its HTML arrives
     by postMessage, and its calls go through the authenticated /ui-tool-call.
+
+    ``server_id`` only decides whether loopback hosts may be declared, exactly as for the
+    sandbox-port route, and is looked up in the stored server row: a server that is not
+    local (or an id that matches no row) gets the strict policy.
     """
+    local = False
+    if server_id:
+        try:
+            from routes.mcp_servers import _server_is_local
+            from storage import mcp_servers_db
+
+            row = mcp_servers_db.get_server(server_id)
+            local = bool(row) and _server_is_local(row)
+        except Exception:  # noqa: BLE001
+            local = False
     csp = _mcp_app_csp(
-        _mcp_app_domains(connect),
-        _mcp_app_domains(resource),
-        _mcp_app_domains(frame),
-        _mcp_app_domains(base_uri, local_schemes = False),
+        _mcp_app_domains(connect, allow_local = local),
+        _mcp_app_domains(resource, allow_local = local),
+        _mcp_app_domains(frame, allow_local = local),
+        _mcp_app_domains(base_uri, local_schemes = False, allow_local = local),
     )
     # The spec's audit trail: the host SHOULD log the CSP each View is given.
     logger.info("MCP App opaque sandbox policy: %s", csp)

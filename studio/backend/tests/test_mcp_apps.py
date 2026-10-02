@@ -315,6 +315,44 @@ def test_a_local_server_may_declare_loopback_only(declared):
         assert parse(lan, allow_local = True) == []
 
 
+def test_blocked_domains_are_what_the_policy_drops_for_this_server():
+    from routes.inference import _mcp_app_blocked_domains as blocked
+
+    csp = {
+        "connectDomains": ["api.example.com", "localhost:11434", "10.0.0.5", "blob:"],
+        "baseUriDomains": ["data:", "*.com"],
+        "frameDomains": "not-a-list",
+    }
+    assert blocked(csp, allow_local = False) == ["localhost:11434", "10.0.0.5", "data:", "*.com"]
+    # A local server may reach loopback, so the caption must not call it blocked.
+    assert blocked(csp, allow_local = True) == ["10.0.0.5", "data:", "*.com"]
+    assert blocked(None, allow_local = True) == []
+
+
+def test_opaque_frame_applies_the_servers_own_loopback_rule(monkeypatch):
+    """The fallback frame learns locality from the stored row, never from the query."""
+    import asyncio
+
+    from routes import inference
+
+    rows = {
+        "stdio": {"url": "stdio:python -m srv"},
+        "remote": {"url": "https://mcp.example.com/mcp"},
+    }
+    monkeypatch.setattr(mcp_servers_db, "get_server", lambda sid: rows.get(sid))
+
+    def csp_for(server_id):
+        response = asyncio.run(
+            inference.mcp_app_frame(connect = "localhost:11434", server_id = server_id)
+        )
+        return response.headers["content-security-policy"]
+
+    assert "localhost:11434" in csp_for("stdio")
+    assert "localhost:11434" not in csp_for("remote")
+    assert "localhost:11434" not in csp_for("no-such-row")
+    assert "localhost:11434" not in csp_for(None)
+
+
 def test_legitimate_public_hosts_still_pass():
     from routes.inference import _mcp_app_domains as parse
 

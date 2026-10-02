@@ -119,6 +119,9 @@ class McpUiResourceResponse(BaseModel):
     # Base64, only for a resource that is not UTF-8 text.
     blob: Optional[str] = None
     ui: dict = Field(default_factory = dict)
+    # Declared CSP domains the sandbox will not allow for this server (private network,
+    # loopback on a remote server, public suffix wildcards ...).
+    blocked_domains: list[str] = Field(default_factory = list)
     contents: list[dict] = Field(default_factory = list)
 
 

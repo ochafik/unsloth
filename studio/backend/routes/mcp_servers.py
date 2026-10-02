@@ -829,7 +829,13 @@ async def read_mcp_ui_resource(
             event = "mcp_servers.ui_resource_failed",
             log = logger,
         )
-    return McpUiResourceResponse(**contents)
+    response = McpUiResourceResponse(**contents)
+    from routes.inference import _mcp_app_blocked_domains
+
+    response.blocked_domains = _mcp_app_blocked_domains(
+        (response.ui or {}).get("csp"), _server_is_local(server)
+    )
+    return response
 
 
 @router.post("/{server_id}/ui-tool-call", response_model = McpUiToolCallResult)
