@@ -37,6 +37,10 @@ const RECORD_MODULE = loadWithStubs<{
   ),
   {
     "@assistant-ui/core/internal": { MessageRepository },
+    "../mcp-apps/model-context": {
+      pruneMcpAppContextForThreads: async () => {},
+      pruneMcpAppContextForMessages: async () => {},
+    },
     "../api/chat-api": { listChatMessages: async () => [] },
     "./chat-history-storage": {
       ensureStoredChatThread: async () => {},
@@ -64,6 +68,10 @@ function harness() {
       import.meta.url,
     ),
     {
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
       "../api/chat-api": {
         saveChatMessage: async (record: Record<string, unknown>) => {
           saved.push(record);

@@ -50,6 +50,10 @@ function harness(): Harness {
     ),
     {
       "@assistant-ui/core/internal": { MessageRepository },
+      "../mcp-apps/model-context": {
+        pruneMcpAppContextForThreads: async () => {},
+        pruneMcpAppContextForMessages: async () => {},
+      },
       "../api/chat-api": {
         listChatMessages: async () => {
           calls.push("listChatMessages");
