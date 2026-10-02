@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -659,6 +660,10 @@ def test_host_advertises_the_mcp_apps_extension_in_its_handshake():
     assert MCP_APPS_EXTENSION_ID not in asyncio.run(ask(Client))
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("mcp.client.extension") is not None,
+    reason = "mcp 2.x advertises through Client(extensions=[...]), not a request amendment",
+)
 def test_the_extension_keeps_any_extension_already_declared():
     import mcp.types as mcp_types
 
